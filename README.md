@@ -20,6 +20,7 @@ Windows Terminal で Claude Code などの対話型のコマンドラインツ�
 - 下に場所が無いときは、Windows Terminal の窓の高さを自動で縮める（最大化されていれば元に戻してから縮める）
 - **Enter**＝貼り付けて送信／**Ctrl+Enter**＝貼り付けだけ／**Shift+Enter**＝改行／**Esc**＝元の窓へ戻る（書きかけは残る）
 - **Ctrl+Shift+J**＝入力窓と元の窓を行き来する。入力窓をしまっているときは出し直す
+- **Tab**（Windows Terminal が前にあるとき）＝入力窓へ飛ぶ（v0.5.0）。Ctrl・Shift・Alt・Win を押しているときと、入力窓をしまっているときは、ふつうの Tab として届く
 - 上の線をつかんで上下に動かすと、入力窓の高さが変わる（覚えておく）
 - **Ctrl+ホイール**または右クリックで、文字の大きさを変える（覚えておく）
 - ファイルや画像を落とすと、その場所（フルパス）が入る（[tkinterdnd2](https://pypi.org/project/tkinterdnd2/) が入っているとき）
@@ -55,6 +56,7 @@ Windows にログインしたときに自動で立ち上げたいときは、`py
   "font_family": "BIZ UDゴシック",
   "font_size": 14,
   "pad_lines": 3,
+  "tab_jump": true,
   "pad_height": 120
 }
 ```
@@ -68,6 +70,7 @@ Windows にログインしたときに自動で立ち上げたいときは、`py
 - 送るときにクリップボードを使います（送った文がクリップボードに残ります）
 - 送る先は、Windows Terminal の窓でいま開いているタブです
 - 画面のスクリーンショット道具で「アクティブな窓」を撮ると、入力窓を選んでいるときは入力窓だけが撮れます（別の窓のため）
+- Tab で入力窓へ飛ぶため、Windows Terminal の中では Tab で候補を確定する操作（Claude Code の / のコマンドやファイル名の候補など）が使えません。使いたいときは `config.json` に `"tab_jump": false` と書いてください。Windows Terminal に直接日本語を打っていて、変換中に Tab で予測候補を選ぶ操作も入力窓へ飛ぶ動きになります
 
 ## ライセンス
 

@@ -5,6 +5,7 @@
 #           下に場所が無いときは、Windows Terminal の窓の高さを入力窓の分だけ自動で縮める（v0.3.0）
 # キー    ：入力窓の中＝Enter 貼り付けて送信／Ctrl+Enter 貼り付けだけ／Shift+Enter 改行／Esc 元の窓へ戻る（書きかけは残る）
 #           Ctrl+Shift+J（config.json で変えられる）＝入力窓と元の窓を行き来する
+#           Windows Terminal が前にあるときの Tab＝入力窓へ飛ぶ（v0.5.0・config.json の tab_jump で切れる）
 # 起動    ：pythonw input_pad.pyw（二重起動しない）
 # ログ    ：logs\input_pad_YYYYMMDD.log（打った文の中身は書かない。文字数だけ。送り先の窓の題名は残る）
 
@@ -28,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.4.8"
+VERSION = "0.5.0"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -59,7 +60,27 @@ WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 HOTKEY_ID = 1
 VK_LBUTTON, VK_CONTROL, VK_SHIFT, VK_MENU, VK_RETURN, VK_V = 0x01, 0x11, 0x10, 0x12, 0x0D, 0x56
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
+VK_TAB = 0x09
 KEYEVENTF_KEYUP = 0x2
+# キーが押された瞬間を見張る仕組み（Tab で入力窓へ飛ぶため・v0.5.0）
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+LLKHF_INJECTED = 0x10    # プログラムが送ったキー（入力窓が送る Ctrl+V など）の印
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD), ("flags", wt.DWORD),
+                ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wt.DWORD]
+user32.SetWindowsHookExW.restype = ctypes.c_void_p
+user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wt.WPARAM, wt.LPARAM]
+user32.CallNextHookEx.restype = ctypes.c_ssize_t
+user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+kernel32.GetModuleHandleW.restype = ctypes.c_void_p
 SW_RESTORE = 9
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x2, 0x4, 0x10
 HWND_TOP = 0
@@ -94,6 +115,7 @@ DEFAULT_CONFIG = {
     "font_family": "BIZ UDゴシック",
     "font_size": 14,
     "pad_lines": 3,
+    "tab_jump": True,    # Windows Terminal が前にあるとき Tab で入力窓へ飛ぶ（false で切る）
 }
 
 
@@ -256,12 +278,39 @@ def tap(vk, with_ctrl=False):
 class HotkeyThread(threading.Thread):
     """RegisterHotKey は登録したスレッドのメッセージループに届くので、専用スレッドで待つ。"""
 
-    def __init__(self, modifiers, vk, events):
+    def __init__(self, modifiers, vk, events, tab_allowed=None):
         super().__init__(daemon=True)
         self.modifiers, self.vk, self.events = modifiers, vk, events
+        self.tab_allowed = tab_allowed   # Tab で飛んでよいかを答える関数（None なら Tab は見張らない）
         self.thread_id = None
         self.ok = threading.Event()
         self.error = None
+        self.tab_hook = None
+        self.tab_eaten = False           # 横取りした Tab の、離したときの知らせも相手へ渡さないため
+
+    def on_key(self, code, wparam, lparam):
+        """Tab で入力窓へ飛ぶ（v0.5.0）。
+        横取りするのは、Windows Terminal が前にあり、Tab だけが押され、人が押したキーのときだけ。
+        Claude Code の入力欄の Tab は候補が出ているときだけ働くので、ふだんは失うものが無い（2026-10-01 説明書と実機で確認）。
+        ここは Windows がキーを止めて待っている途中なので、手早く済ませ、入力窓の操作は置き場（events）に入れて Tk 側でやる。"""
+        try:
+            if code == 0:
+                k = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if k.vkCode == VK_TAB:
+                    if wparam == WM_KEYUP and self.tab_eaten:
+                        self.tab_eaten = False
+                        return 1
+                    if (wparam == WM_KEYDOWN and not (k.flags & LLKHF_INJECTED)
+                            and not any(user32.GetAsyncKeyState(m) & 0x8000
+                                        for m in (VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN))):
+                        fg = user32.GetForegroundWindow()
+                        if is_terminal(fg) and self.tab_allowed():
+                            self.tab_eaten = True
+                            self.events.put(("hotkey", fg))
+                            return 1
+        except Exception:
+            logging.exception("tab hook failed")
+        return user32.CallNextHookEx(None, code, wparam, lparam)
 
     def run(self):
         self.thread_id = kernel32.GetCurrentThreadId()
@@ -269,11 +318,21 @@ class HotkeyThread(threading.Thread):
             self.error = ctypes.get_last_error()
             self.ok.set()
             return
+        if self.tab_allowed:
+            # 見張りの知らせは、見張りを付けたこのスレッドのメッセージループの中で届く
+            self.tab_proc = HOOKPROC(self.on_key)   # 消えないよう持っておく
+            self.tab_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.tab_proc, kernel32.GetModuleHandleW(None), 0)
+            if self.tab_hook:
+                logging.info("tab jump on")
+            else:
+                logging.error("tab hook failed to install (error %s)", ctypes.get_last_error())
         self.ok.set()
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
                 self.events.put(("hotkey", user32.GetForegroundWindow()))
+        if self.tab_hook:
+            user32.UnhookWindowsHookEx(self.tab_hook)
         user32.UnregisterHotKey(None, HOTKEY_ID)
 
     def stop(self):
@@ -331,7 +390,8 @@ class Pad:
         self.ph_on = False        # いま入力欄に薄い案内が入っているか
         self.status = tk.Label(body, anchor="e", padx=10, pady=2, bg=PAD_BG, fg="#8a93a3",
                                font=(cfg["font_family"], 9),
-                               text="Enter＝送信　Ctrl+Enter＝貼り付けだけ　Shift+Enter＝改行　Esc＝元の窓へ　Ctrl+Shift+J＝行き来")
+                               text="Enter＝送信　Ctrl+Enter＝貼り付けだけ　Shift+Enter＝改行　Esc＝元の窓へ　Ctrl+Shift+J＝行き来"
+                                    + ("　黒い画面で Tab＝ここへ" if cfg.get("tab_jump", True) else ""))
         self.status.pack(fill="x")
         self.text.bind("<FocusIn>", lambda e: (self.set_focus_look(True), self.update_placeholder()), add="+")
         self.text.bind("<FocusOut>", lambda e: (self.set_focus_look(False), self.update_placeholder()), add="+")
@@ -740,7 +800,9 @@ def main():
     pad = Pad(root, cfg)
 
     events = queue.Queue()
-    hk = HotkeyThread(mods, vk, events)
+    # 入力窓をしまっている間は Tab を横取りしない（しまったのは使う人の意思なので、Tab で勝手に出さない）
+    tab_allowed = (lambda: not pad.off) if cfg.get("tab_jump", True) else None
+    hk = HotkeyThread(mods, vk, events, tab_allowed)
     hk.start()
     hk.ok.wait(3)
     if hk.error is not None:
