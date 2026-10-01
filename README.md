@@ -5,6 +5,17 @@ A small always-on input box docked under Windows Terminal, for typing Japanese w
 
 個人が作った道具です。Anthropic・Microsoft・Google とは関係ありません。
 
+## すぐ使う（3手）
+
+1. **Python を入れる**（入っていれば飛ばす）：PowerShell かコマンドプロンプトで `winget install Python.Python.3.13`。または https://www.python.org/downloads/ から入れる
+2. **ファイルを取る**：このページ上の緑の **Code** → **Download ZIP** で落とし、好きな場所に展開する
+3. **`start_input_pad.bat` を2回クリック**する。Windows Terminal の窓の下に入力窓が出ます
+
+あとは入力窓で日本語を打って **Enter** で送信。Windows Terminal で **Tab** を押すと入力窓へ飛びます。
+終わるときは、入力窓の中で右クリック →「日本語入力パッドを終了する」。
+
+ログインしたときに自動で立ち上げたいときは、`start_input_pad.bat` のショートカットを、スタートアップフォルダ（`Win+R` → `shell:startup`）に置いてください。
+
 ## なぜ作ったか
 
 Windows Terminal で Claude Code などの対話型のコマンドラインツールを使うと、日本語入力（IME）の予測候補・変換候補の窓が、打っている文字の上に重なって読めないことがあります。
@@ -36,15 +47,13 @@ Windows Terminal で Claude Code などの対話型のコマンドラインツ�
 - 任意：`pip install tkinterdnd2`（ファイルを落とす機能を使うとき）
 - 日本語入力は Google 日本語入力で確かめています。Microsoft IME・ATOK では確かめていません
 
-## 使い方
+## 使い方（コマンドで起動するとき）
 
 ```
 pythonw input_pad.pyw
 ```
 
-二重起動はしません。終了は、入力窓の中で右クリック →「日本語入力パッドを終了する」。
-
-Windows にログインしたときに自動で立ち上げたいときは、`pythonw.exe` で `input_pad.pyw` を開くショートカットを、スタートアップフォルダ（`Win+R` → `shell:startup`）に置いてください。
+二重起動はしません（2つ目は何もせずに終わります）。
 
 ## 設定（任意）
 

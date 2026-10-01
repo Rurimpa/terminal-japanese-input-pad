@@ -1,5 +1,9 @@
 # 変更履歴
 
+## README・起動用ファイル（2026-10-01）
+- 追加：`start_input_pad.bat`（2回クリックで起動。Python が無ければ入れ方を出す）
+- 変更：README のいちばん上に「すぐ使う（3手）」を置いた（Python を入れる／Download ZIP／bat を2回クリック）
+
 ## v0.6.0（2026-10-01）
 - 追加：入力窓を出しているとき、Windows Terminal を選ぶと自動で入力窓へ移る。入力窓から Esc・Ctrl+Shift+J で戻ったときは移らない。ほかの窓を一度選んで戻ると、また移る。マウスのボタンを押している間は待つ。`config.json` の `"auto_focus": false` で切れる
 
