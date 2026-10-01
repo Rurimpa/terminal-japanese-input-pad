@@ -74,7 +74,7 @@ pythonw input_pad.pyw
 
 ## 記録（ログ）
 
-`logs\input_pad_YYYYMMDD.log` に動きの記録を残します。打った文の中身は残さず、文字数だけを残します。ただし、送り先の窓の題名（Windows Terminal のタブの名前）は記録に残ります。
+`logs\input_pad_YYYYMMDD.log` に動きの記録を残します。打った文の中身は残さず、文字数だけを残します。ただし、送り先の窓の題名（Windows Terminal のタブの名前）は記録に残ります。また、自動で入力窓へ移る働きのために、切り替えた窓の種類名（例 `Chrome_WidgetWin_1`。窓の題名ではありません）も記録に残ります。
 
 ## 既知の制限
 
