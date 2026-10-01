@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.6.0"
+VERSION = "0.6.2"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -187,6 +187,14 @@ def window_title(hwnd):
 
 def is_terminal(hwnd):
     return bool(hwnd) and class_name(hwnd) == TERMINAL_CLASS and bool(user32.IsWindowVisible(hwnd))
+
+
+def same_process(a, b):
+    """2つの窓が同じプログラムのものか。"""
+    pa, pb = wt.DWORD(), wt.DWORD()
+    user32.GetWindowThreadProcessId(a, ctypes.byref(pa))
+    user32.GetWindowThreadProcessId(b, ctypes.byref(pb))
+    return pa.value != 0 and pa.value == pb.value
 
 
 def find_terminal():
@@ -646,19 +654,29 @@ class Pad:
         マウスのボタンを押している間は待つ（Windows Terminal の中で文字をなぞって選んでいる途中で奪わないため）。"""
         fg = user32.GetForegroundWindow()
         me = self.hwnd()
-        if fg not in (self.target, me):
+        if not fg:
+            return   # 窓を切り替える途中の「どの窓も選ばれていない」一瞬は数えない（v0.6.1）
+        if fg != self.target and self.target and same_process(fg, self.target):
+            fg = self.target   # Windows Terminal 自身の小さな窓は、Windows Terminal として数える（v0.6.1）
+        elif fg != me and same_process(fg, me):
+            fg = me            # 入力窓自身の別の窓（右クリックのメニューなど）は、入力窓として数える（v0.6.1）
+        if fg not in (self.target, me) and self.stay_in_target:
+            # v0.6.0 では Esc で戻っても引き戻された。
+            # 何の窓のせいでこの印を消したかを残し、次に起きたら原因を追えるようにする
             self.stay_in_target = False
+            logging.info("stay cleared by %r", class_name(fg))
         if fg != self.target:
             self.focus_pending = False
         elif self.prev_fg != self.target:
             self.focus_pending = True
+            self.pending_from = class_name(self.prev_fg) if self.prev_fg else "(none)"
         self.prev_fg = fg
         if not self.focus_pending or user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
             return
         self.focus_pending = False
         if self.stay_in_target or self.off or not self.shown:
             return
-        logging.info("auto focus -> pad")
+        logging.info("auto focus -> pad (from %r)", getattr(self, "pending_from", ""))
         self.activate()
 
     def keep_z_order(self):
@@ -751,6 +769,8 @@ class Pad:
         self.activate()
 
     def activate(self):
+        # 入力窓へ戻ったら、自動で入力窓へ移る働きも戻す（v0.6.2）
+        self.stay_in_target = False
         if self.target and user32.IsIconic(self.target):
             user32.ShowWindow(self.target, SW_RESTORE)
         self.show()
@@ -759,6 +779,7 @@ class Pad:
 
     def focus_target(self):
         self.stay_in_target = True    # 自分から戻ったので、自動で入力窓へ移さない（auto_focus）
+        logging.info("back to terminal (stay)")
         if self.target and user32.IsWindow(self.target):
             force_foreground(self.target)
 
