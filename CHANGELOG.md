@@ -1,5 +1,8 @@
 # 変更履歴
 
+## v0.6.0（2026-10-01）
+- 追加：入力窓を出しているとき、Windows Terminal を選ぶと自動で入力窓へ移る。入力窓から Esc・Ctrl+Shift+J で戻ったときは移らない。ほかの窓を一度選んで戻ると、また移る。マウスのボタンを押している間は待つ。`config.json` の `"auto_focus": false` で切れる
+
 ## v0.5.0（2026-10-01）
 - 追加：Windows Terminal が前にあるとき、Tab を押すと入力窓へ飛ぶ。Ctrl・Shift・Alt・Win を押しているとき、プログラムが送ったキー、入力窓をしまっているときは横取りしない。`config.json` の `"tab_jump": false` で切れる
 

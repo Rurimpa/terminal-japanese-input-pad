@@ -6,6 +6,7 @@
 # キー    ：入力窓の中＝Enter 貼り付けて送信／Ctrl+Enter 貼り付けだけ／Shift+Enter 改行／Esc 元の窓へ戻る（書きかけは残る）
 #           Ctrl+Shift+J（config.json で変えられる）＝入力窓と元の窓を行き来する
 #           Windows Terminal が前にあるときの Tab＝入力窓へ飛ぶ（v0.5.0・config.json の tab_jump で切れる）
+#           入力窓を出しているときに Windows Terminal を選ぶと、自動で入力窓へ移る（v0.6.0・Esc で戻ったときは移らない・config.json の auto_focus で切れる）
 # 起動    ：pythonw input_pad.pyw（二重起動しない）
 # ログ    ：logs\input_pad_YYYYMMDD.log（打った文の中身は書かない。文字数だけ。送り先の窓の題名は残る）
 
@@ -29,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -116,6 +117,7 @@ DEFAULT_CONFIG = {
     "font_size": 14,
     "pad_lines": 3,
     "tab_jump": True,    # Windows Terminal が前にあるとき Tab で入力窓へ飛ぶ（false で切る）
+    "auto_focus": True,  # Windows Terminal を選ぶと自動で入力窓へ移る（false で切る）
 }
 
 
@@ -427,6 +429,9 @@ class Pad:
         self.grip_dragging = False
         self.drag_pad_bottom = None
         self.topmost = False
+        self.prev_fg = None           # 前の回に前にあった窓（Windows Terminal が新しく選ばれたかを見るため）
+        self.focus_pending = False    # Windows Terminal が選ばれ、入力窓へ移る順番を待っている
+        self.stay_in_target = False   # Esc などで自分から元の窓へ戻った（自動で入力窓へ移さない）
 
         self.win.update_idletasks()
         self.min_height = self.win.winfo_reqheight()   # これより低くはしない（3行＋案内の高さ）
@@ -595,6 +600,8 @@ class Pad:
         """200ms ごとに dock_once を呼ぶ。"""
         try:
             self.dock_once()
+            if self.cfg.get("auto_focus", True) and not self.sending:
+                self.auto_focus()
         except Exception:
             logging.exception("dock failed")
         finally:
@@ -631,6 +638,28 @@ class Pad:
         self.place_below(vl, vb, vr, h, wb)
         self.show()
         self.keep_z_order()
+
+    def auto_focus(self):
+        """入力窓を出しているとき、Windows Terminal が選ばれたら自動で入力窓へ移る（v0.6.0）。
+        入力窓から Esc・Ctrl+Shift+J で自分から元の窓へ戻ったときは移さない（許可の質問に答える・Esc で止めるなど、元の窓で打つため）。
+        ほかの窓を一度選んでから戻ってくると、また移る。
+        マウスのボタンを押している間は待つ（Windows Terminal の中で文字をなぞって選んでいる途中で奪わないため）。"""
+        fg = user32.GetForegroundWindow()
+        me = self.hwnd()
+        if fg not in (self.target, me):
+            self.stay_in_target = False
+        if fg != self.target:
+            self.focus_pending = False
+        elif self.prev_fg != self.target:
+            self.focus_pending = True
+        self.prev_fg = fg
+        if not self.focus_pending or user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
+            return
+        self.focus_pending = False
+        if self.stay_in_target or self.off or not self.shown:
+            return
+        logging.info("auto focus -> pad")
+        self.activate()
 
     def keep_z_order(self):
         """Windows Terminal か入力窓が選ばれている間は「いつも手前」にし、ほかの窓が選ばれたらその後ろへ下がる（v0.4.2）。
@@ -729,6 +758,7 @@ class Pad:
         self.text.focus_force()
 
     def focus_target(self):
+        self.stay_in_target = True    # 自分から戻ったので、自動で入力窓へ移さない（auto_focus）
         if self.target and user32.IsWindow(self.target):
             force_foreground(self.target)
 

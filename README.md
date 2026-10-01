@@ -21,6 +21,7 @@ Windows Terminal で Claude Code などの対話型のコマンドラインツ�
 - **Enter**＝貼り付けて送信／**Ctrl+Enter**＝貼り付けだけ／**Shift+Enter**＝改行／**Esc**＝元の窓へ戻る（書きかけは残る）
 - **Ctrl+Shift+J**＝入力窓と元の窓を行き来する。入力窓をしまっているときは出し直す
 - **Tab**（Windows Terminal が前にあるとき）＝入力窓へ飛ぶ（v0.5.0）。Ctrl・Shift・Alt・Win を押しているときと、入力窓をしまっているときは、ふつうの Tab として届く
+- 入力窓を出しているときに Windows Terminal を選ぶ（クリック・Alt+Tab など）と、自動で入力窓へ移る（v0.6.0）。入力窓から **Esc** で戻ったときは移らないので、Claude Code の許可の質問に答えたり、Esc で止めたりできる。ほかの窓を一度選んで戻ると、また移る
 - 上の線をつかんで上下に動かすと、入力窓の高さが変わる（覚えておく）
 - **Ctrl+ホイール**または右クリックで、文字の大きさを変える（覚えておく）
 - ファイルや画像を落とすと、その場所（フルパス）が入る（[tkinterdnd2](https://pypi.org/project/tkinterdnd2/) が入っているとき）
@@ -57,6 +58,7 @@ Windows にログインしたときに自動で立ち上げたいときは、`py
   "font_size": 14,
   "pad_lines": 3,
   "tab_jump": true,
+  "auto_focus": true,
   "pad_height": 120
 }
 ```
