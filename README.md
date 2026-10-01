@@ -8,7 +8,9 @@ A small always-on input box docked under Windows Terminal, for typing Japanese w
 ## なぜ作ったか
 
 Windows Terminal で Claude Code などの対話型のコマンドラインツールを使うと、日本語入力（IME）の予測候補・変換候補の窓が、打っている文字の上に重なって読めないことがあります。
-ツール側が入力欄の本当の位置を Windows に知らせていないためで、利用者の側の設定では直せません（参考：[anthropics/claude-code#70955](https://github.com/anthropics/claude-code/issues/70955)）。
+原因は Windows Terminal の不具合です（[microsoft/terminal#20318](https://github.com/microsoft/terminal/issues/20318)）。直し（[microsoft/terminal#20627](https://github.com/microsoft/terminal/pull/20627)）は 2026-09-01 に Windows Terminal の開発版へ入りましたが、2026-10-01 時点で配布されている Stable（1.24.11911.0）・Preview（1.25.1912.0）にはまだ入っていません（Canary には入っています）。利用者の側の設定では直せません。参考：[anthropics/claude-code#70955](https://github.com/anthropics/claude-code/issues/70955)
+
+この道具は、Windows Terminal の直しが届くまでのつなぎです。直しの入った版が配られたら、要らなくなるかもしれません。
 
 この道具は、Windows Terminal の窓のすぐ下に普通の Windows の入力窓を置きます。そこで打てば、候補の窓は文字の位置に正しく出て、重なりません。打ち終わって Enter を押すと、文が元の窓へ貼り付けられ、そのまま送信されます。
 
