@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -96,15 +96,6 @@ GRIP_H = 6               # 上の線のつかめる幅（見た目の線は ACCE
 MAX_PAD_RATIO = 0.6      # 入力窓の高さの上限（画面の高さに対する割合）
 MIN_FONT, MAX_FONT = 8, 32   # 文字の大きさの範囲
 TEXT_TOP = 8             # 入力窓の上の線から、字の始まりまでの余白
-# 記号のキーの名前（Tk）→ 入れる文字。日本語入力からの確定で文字の情報が空になったときに使う
-SYMBOL_KEYS = {
-    "minus": "-", "underscore": "_", "plus": "+", "equal": "=", "period": ".", "comma": ",", "slash": "/",
-    "backslash": "\\", "colon": ":", "semicolon": ";", "at": "@", "exclam": "!", "question": "?",
-    "numbersign": "#", "dollar": "$", "percent": "%", "ampersand": "&", "asterisk": "*",
-    "quotedbl": '"', "apostrophe": "'", "quoteright": "'", "grave": "`", "quoteleft": "`", "asciitilde": "~", "asciicircum": "^",
-    "bar": "|", "less": "<", "greater": ">", "parenleft": "(", "parenright": ")",
-    "bracketleft": "[", "bracketright": "]", "braceleft": "{", "braceright": "}",
-}
 PLACEHOLDER_TEXT = "ここに日本語を入力（Enter で送信）"   # 打てない状態で空のときに出す薄い案内
 PAD_BG = "#1c2433"       # 入力窓の背景（Claude Code の黒より少し青い）
 ACCENT_ON = "#e8833a"    # 打てるとき（Claude のオレンジ）
@@ -406,7 +397,6 @@ class Pad:
         self.text.bind("<FocusIn>", lambda e: (self.set_focus_look(True), self.update_placeholder()), add="+")
         self.text.bind("<FocusOut>", lambda e: (self.set_focus_look(False), self.update_placeholder()), add="+")
         self.text.bind("<KeyRelease>", lambda e: self.update_placeholder(), add="+")
-        self.text.bind("<KeyPress>", self.on_keypress, add="+")
         self.hook_ime()
 
         self.text.bind("<Return>", lambda e: (self.send(submit=True), "break")[1])
@@ -523,24 +513,6 @@ class Pad:
             self.ph_on = False
         self.text.insert("insert", result)
         self.text.see("insert")
-
-    def on_keypress(self, event):
-        """日本語入力で確定した記号が、文字の情報が空のまま届いて入らないことがある（v0.4.3）。
-        例＝予測候補「1-2行以内で…」を選ぶと「12行以内で…」になった。
-        日本語入力をオフにして打つとハイフンは残った（同日確認）。
-        文字の情報が空で、記号のキーだと分かるものだけ、ここで入れる（ふつうに打ったときは文字の情報があるので働かない）。"""
-        if event.char or event.state & 0x4:   # 文字の情報がある／Ctrl を押している
-            return None
-        ch = SYMBOL_KEYS.get(event.keysym)
-        if not ch:
-            return None
-        if self.ph_on:
-            self.text.delete("1.0", "end")
-            self.ph_on = False
-        self.text.insert("insert", ch)
-        self.text.see("insert")
-        logging.info("empty-char key filled")   # どのキーかは残さない（v0.4.8・打った中身を残さないため）
-        return "break"
 
     def current_text(self):
         """打った文（薄い案内は数えない）。"""
