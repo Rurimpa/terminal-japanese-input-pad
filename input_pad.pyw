@@ -7,6 +7,8 @@
 #           Ctrl+Shift+J（config.json で変えられる）＝入力窓と元の窓を行き来する
 #           Windows Terminal が前にあるときの Tab＝入力窓へ飛ぶ（v0.5.0・config.json の tab_jump で切れる）
 #           入力窓を出しているときに Windows Terminal を選ぶと、自動で入力窓へ移る（v0.6.0・Esc で戻ったときは移らない・config.json の auto_focus で切れる）
+#           入力窓の中の Ctrl+C（文字を選んでいないとき）＝元の窓へ Ctrl+C を送って止める（v0.7.0）
+#           Windows Terminal の窓が複数あるときは、選んだ窓の下へくっつき直す（v0.7.0・Codex の窓など）
 # 起動    ：pythonw input_pad.pyw（二重起動しない）
 # ログ    ：logs\input_pad_YYYYMMDD.log（打った文の中身は書かない。文字数だけ。送り先の窓の題名は残る）
 
@@ -30,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.6.3"
+VERSION = "0.7.0"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -62,6 +64,7 @@ HOTKEY_ID = 1
 VK_LBUTTON, VK_CONTROL, VK_SHIFT, VK_MENU, VK_RETURN, VK_V = 0x01, 0x11, 0x10, 0x12, 0x0D, 0x56
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
 VK_TAB = 0x09
+VK_C = 0x43
 KEYEVENTF_KEYUP = 0x2
 # キーが押された瞬間を見張る仕組み（Tab で入力窓へ飛ぶため・v0.5.0）
 WH_KEYBOARD_LL = 13
@@ -391,7 +394,7 @@ class Pad:
         self.ph_on = False        # いま入力欄に薄い案内が入っているか
         self.status = tk.Label(body, anchor="e", padx=10, pady=2, bg=PAD_BG, fg="#8a93a3",
                                font=(cfg["font_family"], 9),
-                               text="Enter＝送信　Ctrl+Enter＝貼り付けだけ　Shift+Enter＝改行　Esc＝元の窓へ　Ctrl+Shift+J＝行き来"
+                               text="Enter＝送信　Ctrl+Enter＝貼り付けだけ　Shift+Enter＝改行　Ctrl+C＝止める　Esc＝元の窓へ　Ctrl+Shift+J＝行き来"
                                     + ("　黒い画面で Tab＝ここへ" if cfg.get("tab_jump", True) else ""))
         self.status.pack(fill="x")
         self.text.bind("<FocusIn>", lambda e: (self.set_focus_look(True), self.update_placeholder()), add="+")
@@ -403,6 +406,8 @@ class Pad:
         self.text.bind("<Control-Return>", lambda e: (self.send(submit=False), "break")[1])
         self.text.bind("<Shift-Return>", self.on_shift_enter)
         self.text.bind("<Escape>", lambda e: (self.focus_target(), "break")[1])
+        self.text.bind("<Control-c>", self.on_ctrl_c)
+        self.text.bind("<Control-C>", self.on_ctrl_c)   # Caps Lock が入っているとき
         self.text.bind("<Button-1>", lambda e: self.activate(), add="+")
 
         menu = tk.Menu(self.win, tearoff=0)
@@ -591,6 +596,7 @@ class Pad:
         """Windows Terminal の窓の下にくっつける。"""
         if self.sending:
             return
+        self.follow_selected_terminal(user32.GetForegroundWindow())
         if not (self.target and user32.IsWindow(self.target) and user32.IsWindowVisible(self.target)):
             new = find_terminal()
             if new != self.target:
@@ -618,6 +624,19 @@ class Pad:
         self.place_below(vl, vb, vr, h, wb)
         self.show()
         self.keep_z_order()
+
+    def follow_selected_terminal(self, fg):
+        """別の Windows Terminal の窓が選ばれたら、その窓へくっつき直す（v0.7.0）。
+        v0.6.3 までは最初にくっついた窓から離れず、Codex の窓（codex_ClaudeCode_1）を選んでも、
+        Windows Terminal の窓はどれも同じプログラムなので「くっついている窓」と数え（v0.6.1）、
+        入力窓は元の窓の下に出たまま、送り先も元の窓だった。"""
+        if not fg or fg == self.target or self.grip_dragging or not is_terminal(fg):
+            return False
+        logging.info("target -> %s %r (selected)", fg, window_title(fg))
+        self.target = fg
+        self.last_layout = None
+        self.stay_in_target = False   # 別の窓を選んだので、Esc で戻った印は下ろす（auto_focus で入力窓へ移る）
+        return True
 
     def auto_focus(self):
         """入力窓を出しているとき、Windows Terminal が選ばれたら自動で入力窓へ移る（v0.6.0）。
@@ -754,6 +773,32 @@ class Pad:
         logging.info("back to terminal (stay)")
         if self.target and user32.IsWindow(self.target):
             force_foreground(self.target)
+
+    def on_ctrl_c(self, event):
+        """入力窓の中の Ctrl+C（v0.7.0）。
+        文字を選んでいるときは今までどおりコピー。選んでいないときは元の窓へ Ctrl+C を送り、Claude Code・Codex の動きを止める。
+        v0.6.3 までは Tk が Ctrl+C をコピーとして受け取って元の窓へ届かず、元の窓をクリックしても入力窓へ引き戻されるので、止める手が Esc で戻ってからしか無かった。"""
+        if self.text.tag_ranges("sel"):
+            return None
+        self.send_ctrl_c()
+        return "break"
+
+    def send_ctrl_c(self):
+        if not self.target or not user32.IsWindow(self.target):
+            self.status.config(text="Ctrl+C の送り先の Windows Terminal が見つかりません。", fg="#ff8080")
+            logging.warning("ctrl+c aborted: no target")
+            return
+        self.sending = True
+        try:
+            if not force_foreground(self.target):
+                logging.warning("SetForegroundWindow failed target=%s", self.target)
+            time.sleep(0.15)
+            tap(VK_C, with_ctrl=True)
+            time.sleep(0.15)
+            logging.info("ctrl+c sent target=%r", window_title(self.target))
+        finally:
+            self.sending = False
+        self.activate()   # 止めたあとも入力窓へ戻り、続けて打てるようにする
 
     def on_shift_enter(self, event):
         self.text.insert("insert", "\n")
