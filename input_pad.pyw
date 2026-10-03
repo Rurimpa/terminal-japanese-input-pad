@@ -8,7 +8,7 @@
 #           Windows Terminal が前にあるときの Tab＝入力窓へ飛ぶ（v0.5.0・config.json の tab_jump で切れる）
 #           入力窓を出しているときに Windows Terminal を選ぶと、自動で入力窓へ移る（v0.6.0・Esc で戻ったときは移らない・config.json の auto_focus で切れる）
 #           入力窓の中の Ctrl+C（文字を選んでいないとき）＝元の窓へ Ctrl+C を送って止める（v0.7.0）
-#           Windows Terminal の窓が複数あるときは、選んだ窓の下へくっつき直す（v0.7.0・Codex の窓など）
+#           Windows Terminal の窓ごとに入力窓を1つずつ出す（v0.8.0・Codex の窓など。書きかけは入力窓ごとに別々）
 # 起動    ：pythonw input_pad.pyw（二重起動しない）
 # ログ    ：logs\input_pad_YYYYMMDD.log（打った文の中身は書かない。文字数だけ。送り先の窓の題名は残る）
 
@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -90,6 +90,7 @@ SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x2, 0x4, 0x10
 HWND_TOP = 0
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
+DWMWA_CLOAKED = 14
 MONITOR_DEFAULTTONEAREST = 2
 TERMINAL_CLASS = "CASCADIA_HOSTING_WINDOW_CLASS"   # Windows Terminal の窓
 MIN_TERMINAL_HEIGHT = 240                          # これより縮めない（縮められないときは窓の一番下に重ねて出す）
@@ -191,19 +192,26 @@ def same_process(a, b):
     return pa.value != 0 and pa.value == pb.value
 
 
-def find_terminal():
-    """前にある Windows Terminal の窓を1つ選ぶ（Z順で一番手前）。"""
+def list_terminals():
+    """開いている Windows Terminal の窓をすべて返す（v0.8.0。窓ごとに入力窓を作るため。v0.7.0 までは一番手前の1つだけを選んでいた）。"""
     found = []
 
     @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
     def cb(h, _):
         if is_terminal(h):
             found.append(h)
-            return False
         return True
 
     user32.EnumWindows(cb, 0)
-    return found[0] if found else None
+    return found
+
+
+def is_cloaked(hwnd):
+    """別の仮想デスクトップへ移した窓など、Windows が画面に描いていない窓か。"""
+    v = wt.DWORD()
+    if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(v), ctypes.sizeof(v)) == 0:
+        return v.value != 0
+    return False
 
 
 def window_rect(hwnd):
@@ -308,7 +316,7 @@ class HotkeyThread(threading.Thread):
                             and not any(user32.GetAsyncKeyState(m) & 0x8000
                                         for m in (VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN))):
                         fg = user32.GetForegroundWindow()
-                        if is_terminal(fg) and self.tab_allowed():
+                        if is_terminal(fg) and self.tab_allowed(fg):
                             self.tab_eaten = True
                             self.events.put(("hotkey", fg))
                             return 1
@@ -347,10 +355,14 @@ class HotkeyThread(threading.Thread):
 # ---------------- 入力窓 ----------------
 
 class Pad:
-    def __init__(self, root, cfg):
+    """Windows Terminal の窓1つを受け持つ入力窓（v0.8.0〜。窓ごとに1つ作る）。"""
+
+    def __init__(self, root, cfg, manager, target):
         self.root = root
         self.cfg = cfg
-        self.target = None
+        self.manager = manager
+        self.target = target          # 受け持ちの Windows Terminal の窓（変わらない）
+        self.alive = True
         self.last_layout = None
         self.shown = False
         self.sending = False
@@ -373,9 +385,9 @@ class Pad:
             w.bind("<B1-Motion>", self.on_grip_drag)
             w.bind("<ButtonRelease-1>", self.on_grip_release)
 
-        # 文字の大きさを後から変えられるよう、名前つきの字体にする（v0.4.0）
-        self.font = tkfont.Font(family=cfg["font_family"], size=int(cfg["font_size"]))
-        self.font_bold = tkfont.Font(family=cfg["font_family"], size=int(cfg["font_size"]), weight="bold")
+        # 文字の大きさを後から変えられるよう、名前つきの字体にする（v0.4.0）。
+        # 字体はすべての入力窓で1つを分け合う（v0.8.0。1つの入力窓で大きさを変えると、ほかの入力窓も同じ大きさになる）
+        self.font, self.font_bold = manager.font, manager.font_bold
         font = self.font
         body = tk.Frame(self.win, bg=PAD_BG)
         body.pack(fill="both", expand=True)
@@ -510,7 +522,8 @@ class Pad:
             pass
         except Exception:
             logging.exception("ime insert failed")
-        self.root.after(30, self.drain_ime)
+        if self.alive:
+            self.root.after(30, self.drain_ime)
 
     def insert_ime_result(self, result):
         if self.ph_on:
@@ -543,6 +556,12 @@ class Pad:
         size = max(MIN_FONT, min(MAX_FONT, int(self.font.cget("size")) + step))
         self.font.configure(size=size)
         self.font_bold.configure(size=size)
+        for pad in self.manager.pads.values():   # 字体は分け合っているので、すべての入力窓を測り直す（v0.8.0）
+            pad.refit_font()
+        save_config_value("font_size", size)
+        logging.info("font size -> %d (min_h=%d)", size, self.min_height)
+
+    def refit_font(self):
         self.win.update_idletasks()
         self.min_height = self.win.winfo_reqheight()   # 3行＋案内に要る高さ（文字の大きさに合わせて測り直す）
         self.last_layout = None
@@ -551,8 +570,6 @@ class Pad:
         self.text.configure(font=self.font)
         self.text.yview_moveto(0)
         self.text.see("insert")
-        save_config_value("font_size", size)
-        logging.info("font size -> %d (min_h=%d)", size, self.min_height)
 
     # --- 入力窓を出す・しまう ---
     def turn_off(self):
@@ -582,28 +599,21 @@ class Pad:
 
     # --- くっつく ---
     def dock(self):
-        """200ms ごとに dock_once を呼ぶ。"""
+        """200ms ごとに PadManager から呼ばれる（v0.7.0 までは自分で次の回を決めていた）。"""
         try:
             self.dock_once()
             if self.cfg.get("auto_focus", True) and not self.sending:
                 self.auto_focus()
         except Exception:
             logging.exception("dock failed")
-        finally:
-            self.root.after(DOCK_INTERVAL_MS, self.dock)
 
     def dock_once(self):
-        """Windows Terminal の窓の下にくっつける。"""
+        """受け持ちの Windows Terminal の窓の下にくっつける（受け持ちの窓は作ったときに決まり、変わらない・v0.8.0）。"""
         if self.sending:
             return
-        self.follow_selected_terminal(user32.GetForegroundWindow())
-        if not (self.target and user32.IsWindow(self.target) and user32.IsWindowVisible(self.target)):
-            new = find_terminal()
-            if new != self.target:
-                logging.info("target -> %s %r", new, window_title(new) if new else "")
-            self.target = new
-        if self.off or not self.target or user32.IsIconic(self.target):
-            self.hide("off" if self.off else ("no terminal" if not self.target else "terminal minimized"))
+        if self.off or user32.IsIconic(self.target) or is_cloaked(self.target):
+            # 別の仮想デスクトップへ移した窓は「見えている」と答えるが画面には無いので、隠れているものとして扱う
+            self.hide("off" if self.off else ("terminal minimized" if user32.IsIconic(self.target) else "terminal cloaked"))
             return
 
         wl, wt_, wr, wb = work_area(self.target)
@@ -625,19 +635,6 @@ class Pad:
         self.show()
         self.keep_z_order()
 
-    def follow_selected_terminal(self, fg):
-        """別の Windows Terminal の窓が選ばれたら、その窓へくっつき直す（v0.7.0）。
-        v0.6.3 までは最初にくっついた窓から離れず、Codex の窓（codex_ClaudeCode_1）を選んでも、
-        Windows Terminal の窓はどれも同じプログラムなので「くっついている窓」と数え（v0.6.1）、
-        入力窓は元の窓の下に出たまま、送り先も元の窓だった。"""
-        if not fg or fg == self.target or self.grip_dragging or not is_terminal(fg):
-            return False
-        logging.info("target -> %s %r (selected)", fg, window_title(fg))
-        self.target = fg
-        self.last_layout = None
-        self.stay_in_target = False   # 別の窓を選んだので、Esc で戻った印は下ろす（auto_focus で入力窓へ移る）
-        return True
-
     def auto_focus(self):
         """入力窓を出しているとき、Windows Terminal が選ばれたら自動で入力窓へ移る（v0.6.0）。
         入力窓から Esc・Ctrl+Shift+J で自分から元の窓へ戻ったときは移さない（許可の質問に答える・Esc で止めるなど、元の窓で打つため）。
@@ -647,9 +644,10 @@ class Pad:
         me = self.hwnd()
         if not fg:
             return   # 窓を切り替える途中の「どの窓も選ばれていない」一瞬は数えない（v0.6.1）
-        if fg != self.target and self.target and same_process(fg, self.target):
+        # Windows Terminal のほかの窓・ほかの入力窓は、同じプログラムでも別の窓として数える（v0.8.0。窓ごとに入力窓があるため）
+        if fg != self.target and same_process(fg, self.target) and not is_terminal(fg):
             fg = self.target   # Windows Terminal 自身の小さな窓は、Windows Terminal として数える（v0.6.1）
-        elif fg != me and same_process(fg, me):
+        elif fg != me and same_process(fg, me) and fg not in self.manager.pad_hwnds():
             fg = me            # 入力窓自身の別の窓（右クリックのメニューなど）は、入力窓として数える（v0.6.1）
         if fg not in (self.target, me) and self.stay_in_target:
             # v0.6.0 では Esc で戻っても引き戻された。
@@ -726,6 +724,11 @@ class Pad:
         self.grip_dragging = False
         if self.pad_h:
             save_config_value("pad_height", int(self.pad_h))
+            self.cfg["pad_height"] = int(self.pad_h)   # これから開く窓の入力窓も同じ高さにする
+            for pad in self.manager.pads.values():   # 高さもすべての入力窓でそろえる（v0.8.0。次の回にそれぞれの窓で合わせ直す）
+                if pad is not self:
+                    pad.pad_h = self.pad_h
+                    pad.last_layout = None
         logging.info("pad resized by grip: pad h=%s", self.pad_h)
 
     def show(self):
@@ -753,15 +756,20 @@ class Pad:
         if fg == self.hwnd():
             self.focus_target()
             return
-        if is_terminal(fg) and fg != self.target:
-            self.target = fg
-            self.last_layout = None
-            logging.info("target -> %s %r (hotkey)", fg, window_title(fg))
         self.activate()
+
+    def destroy(self):
+        """受け持ちの窓が閉じられたので、この入力窓も消す（v0.8.0）。"""
+        self.alive = False
+        try:
+            self.win.destroy()
+        except Exception:
+            logging.exception("pad destroy failed")
 
     def activate(self):
         # 入力窓へ戻ったら、自動で入力窓へ移る働きも戻す（v0.6.2）
         self.stay_in_target = False
+        self.manager.last_pad = self
         if self.target and user32.IsIconic(self.target):
             user32.ShowWindow(self.target, SW_RESTORE)
         self.show()
@@ -841,6 +849,72 @@ class Pad:
         self.root.event_generate("<<QuitPad>>")
 
 
+class PadManager:
+    """Windows Terminal の窓を数え、窓ごとに入力窓を1つ作り、窓が閉じたら消す（v0.8.0）。
+    v0.7.0 までは入力窓が1つで、選んだ窓の下へ移っていた（書きかけの文は窓をまたいで1つだった）。
+    ホットキー・Tab・自動で入力窓へ移る働きは、いま前にある窓の入力窓へ向ける。"""
+
+    def __init__(self, root, cfg):
+        self.root = root
+        self.cfg = cfg
+        self.font = tkfont.Font(family=cfg["font_family"], size=int(cfg["font_size"]))
+        self.font_bold = tkfont.Font(family=cfg["font_family"], size=int(cfg["font_size"]), weight="bold")
+        self.pads = {}          # 受け持ちの Windows Terminal の窓 → 入力窓
+        self.last_pad = None    # 最後に使った入力窓（Windows Terminal 以外が前にあるときのホットキーの行き先）
+        self.sync()
+
+    def pad_hwnds(self):
+        return {p.hwnd() for p in self.pads.values()}
+
+    def sync(self):
+        """新しく開いた窓には入力窓を作り、閉じた窓の入力窓は消す。
+        消すのは窓そのものが無くなったときだけ（隠れた・別の仮想デスクトップへ移しただけなら、書きかけを残すため消さない）。"""
+        for h in list_terminals():
+            if h not in self.pads:
+                self.pads[h] = Pad(self.root, self.cfg, self, h)
+                logging.info("pad created for %s %r (pads=%d)", h, window_title(h), len(self.pads))
+        for h in [h for h in self.pads if not (user32.IsWindow(h) and class_name(h) == TERMINAL_CLASS)]:
+            pad = self.pads.pop(h)
+            if self.last_pad is pad:
+                self.last_pad = None
+            pad.destroy()
+            logging.info("pad removed for closed terminal %s (pads=%d)", h, len(self.pads))
+
+    def tick(self):
+        """200ms ごとに、窓を数え直し、それぞれの入力窓をくっつける。"""
+        try:
+            self.sync()
+            for pad in list(self.pads.values()):
+                pad.dock()
+        except Exception:
+            logging.exception("tick failed")
+        finally:
+            self.root.after(DOCK_INTERVAL_MS, self.tick)
+
+    def pad_for(self, hwnd):
+        """その窓（Windows Terminal の窓か、入力窓自身）を受け持つ入力窓。"""
+        if hwnd in self.pads:
+            return self.pads[hwnd]
+        for p in self.pads.values():
+            if p.hwnd() == hwnd:
+                return p
+        return None
+
+    def on_hotkey(self, fg):
+        pad = self.pad_for(fg)
+        if pad is None:   # Windows Terminal 以外が前にあるときは、最後に使った入力窓へ
+            pad = self.last_pad if self.last_pad and self.last_pad.alive else next(iter(self.pads.values()), None)
+        if pad is None:
+            logging.info("hotkey: no terminal window")
+            return
+        pad.on_hotkey(fg)
+
+    def tab_allowed(self, fg):
+        """Tab を横取りしてよいか（キーの見張りのスレッドから呼ばれる）。その窓の入力窓があり、しまっていないときだけ。"""
+        pad = self.pads.get(fg)
+        return pad is not None and not pad.off
+
+
 def parse_hotkey(cfg):
     mods = 0
     table = {"ctrl": MOD_CONTROL, "shift": MOD_SHIFT, "alt": MOD_ALT, "win": MOD_WIN}
@@ -865,11 +939,11 @@ def main():
     if not TkinterDnD:
         logging.warning("tkinterdnd2 が無いので、ファイルを落とす機能は使えません")
     root.title(APP_NAME)
-    pad = Pad(root, cfg)
+    manager = PadManager(root, cfg)
 
     events = queue.Queue()
     # 入力窓をしまっている間は Tab を横取りしない（しまったのは使う人の意思なので、Tab で勝手に出さない）
-    tab_allowed = (lambda: not pad.off) if cfg.get("tab_jump", True) else None
+    tab_allowed = manager.tab_allowed if cfg.get("tab_jump", True) else None
     hk = HotkeyThread(mods, vk, events, tab_allowed)
     hk.start()
     hk.ok.wait(3)
@@ -880,14 +954,14 @@ def main():
                                        f"config.json の hotkey_key を変えて起動し直してください。（エラー {hk.error}）")
         root.destroy()
         return
-    logging.info("start v%s pid=%s hotkey mods=%s vk=%s pad_h=%s", VERSION, kernel32.GetCurrentProcessId(), mods, vk, pad.min_height)
+    logging.info("start v%s pid=%s hotkey mods=%s vk=%s pads=%d", VERSION, kernel32.GetCurrentProcessId(), mods, vk, len(manager.pads))
 
     def poll():
         try:
             while True:
                 kind, hwnd = events.get_nowait()
                 if kind == "hotkey":
-                    pad.on_hotkey(hwnd)
+                    manager.on_hotkey(hwnd)
         except queue.Empty:
             pass
         root.after(50, poll)
@@ -898,7 +972,7 @@ def main():
 
     root.bind("<<QuitPad>>", quit_all)
     root.after(50, poll)
-    root.after(DOCK_INTERVAL_MS, pad.dock)
+    root.after(DOCK_INTERVAL_MS, manager.tick)
     root.mainloop()
     logging.info("stop")
 
