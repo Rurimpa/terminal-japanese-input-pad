@@ -1,4 +1,5 @@
 # input_pad.pyw — 日本語入力パッド（常設の入力窓）
+# 作者    ：Rurimpa（https://github.com/Rurimpa）・MIT License。使うとき・直して使うときは、作者名とこの置き場のアドレスを残してください
 # 何のため：Claude Code など黒い画面（Windows Terminal）の入力欄に、日本語入力の予測候補の窓が重なって読めない問題をよけるため。
 #           Windows Terminal の窓のすぐ下に、普通の Windows の入力窓をいつも出しておき、そこで打った文を元の窓へ貼り付けて送る。
 # 動き    ：Windows Terminal の窓の下に同じ横幅でくっつき、窓を動かす・幅を変えるとついてくる。最小化すると一緒に隠れる。
