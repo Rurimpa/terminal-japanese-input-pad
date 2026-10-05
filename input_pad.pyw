@@ -10,6 +10,7 @@
 #           入力窓を出しているときに Windows Terminal を選ぶと、自動で入力窓へ移る（v0.6.0・Esc で戻ったときは移らない・config.json の auto_focus で切れる）
 #           入力窓の中の Ctrl+C（文字を選んでいないとき）＝元の窓へ Ctrl+C を送って止める（v0.7.0）
 #           Windows Terminal の窓ごとに入力窓を1つずつ出す（v0.8.0・Codex の窓など。書きかけは入力窓ごとに別々）
+#           入力窓が空のときの ↑・↓・Enter＝元の窓へ送る（v0.10.0。Claude Code の選ぶ画面を入力窓のまま選べる）
 #           入力窓が選ばれているときの Win＋矢印＝Windows Terminal の窓を寄せる（v0.9.0。↑全画面／←→左右半分／↓元に戻す。
 #           左右半分から↑↓で上下4分の1・v0.9.1）
 # 起動    ：pythonw input_pad.pyw（二重起動しない）
@@ -35,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.9.1"
+VERSION = "0.10.0"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -56,6 +57,7 @@ imm32.ImmGetCompositionStringW.argtypes = [ctypes.c_void_p, wt.DWORD, ctypes.c_v
 imm32.ImmGetCompositionStringW.restype = ctypes.c_long
 WM_IME_COMPOSITION = 0x010F
 GCS_RESULTSTR = 0x0800
+GCS_COMPSTR = 0x0008
 GWLP_WNDPROC = -4
 # 入れる窓の値に -1（いつも手前）などを渡すので、64ビットでも正しく渡るよう型を決めておく
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
@@ -469,7 +471,10 @@ class Pad:
         self.text.bind("<KeyRelease>", lambda e: self.update_placeholder(), add="+")
         self.hook_ime()
 
-        self.text.bind("<Return>", lambda e: (self.send(submit=True), "break")[1])
+        self.text.bind("<Return>", self.on_return)
+        # 入力窓が空のときの ↑↓ は元の窓へ送る（v0.10.0＝Claude Code の選ぶ画面）
+        self.text.bind("<Up>", lambda e: self.on_nav_key(e, VK_UP))
+        self.text.bind("<Down>", lambda e: self.on_nav_key(e, VK_DOWN))
         self.text.bind("<Control-Return>", lambda e: (self.send(submit=False), "break")[1])
         self.text.bind("<Shift-Return>", self.on_shift_enter)
         self.text.bind("<Escape>", lambda e: (self.focus_target(), "break")[1])
@@ -927,21 +932,61 @@ class Pad:
         return "break"
 
     def send_ctrl_c(self):
+        self.send_key(VK_C, "ctrl+c", with_ctrl=True)
+
+    def send_key(self, vk, label, with_ctrl=False):
+        """元の窓を前に出してキーを1回送り、入力窓へ戻る（Ctrl+C・v0.7.0／↑↓Enter・v0.10.0）。"""
         if not self.target or not user32.IsWindow(self.target):
-            self.status.config(text="Ctrl+C の送り先の Windows Terminal が見つかりません。", fg="#ff8080")
-            logging.warning("ctrl+c aborted: no target")
+            self.status.config(text=f"{label} の送り先の Windows Terminal が見つかりません。", fg="#ff8080")
+            logging.warning("%s aborted: no target", label)
             return
         self.sending = True
         try:
             if not force_foreground(self.target):
                 logging.warning("SetForegroundWindow failed target=%s", self.target)
             time.sleep(0.15)
-            tap(VK_C, with_ctrl=True)
+            tap(vk, with_ctrl=with_ctrl)
             time.sleep(0.15)
-            logging.info("ctrl+c sent target=%r", window_title(self.target))
+            logging.info("%s sent target=%r", label, window_title(self.target))
         finally:
             self.sending = False
-        self.activate()   # 止めたあとも入力窓へ戻り、続けて打てるようにする
+        self.activate()   # 送ったあとも入力窓へ戻り、続けて打てるようにする
+
+    def composing(self):
+        """日本語入力の変換中か（変換中の ↑↓Enter は候補を選ぶ・確定するためのキーなので、元の窓へ送らない）。"""
+        try:
+            # 確定文字は inner の窓に届いている（記録の「ime result at inner」）。キーが届いている窓と入力窓の3つの窓を全部見る
+            for hwnd in {user32.GetFocus(), self.text.winfo_id(), self.win.winfo_id(), self.hwnd()}:
+                if not hwnd:
+                    continue
+                ctx = imm32.ImmGetContext(hwnd)
+                if not ctx:
+                    continue
+                try:
+                    if imm32.ImmGetCompositionStringW(ctx, GCS_COMPSTR, None, 0) > 0:
+                        return True
+                finally:
+                    imm32.ImmReleaseContext(hwnd, ctx)
+            return False
+        except Exception:
+            logging.exception("composing check failed")
+            return True   # 分からないときは送らない側に倒す
+
+    def on_nav_key(self, event, vk):
+        """入力窓が空で、Shift・Ctrl を押しておらず、変換中でないときだけ、↑↓ を元の窓へ送る。
+        Claude Code の「このフォルダを信用しますか」や許可の質問は ↑↓ で選ぶので、入力窓にいると選べなかった（2026-10-05）。"""
+        if self.current_text() or event.state & 0x5 or self.composing():
+            return None   # 文字があるときは、入力窓の中でカーソルを動かす
+        self.send_key(vk, "up" if vk == VK_UP else "down")
+        return "break"
+
+    def on_return(self, event):
+        """文字があれば今までどおり送信。空なら Enter を元の窓へ送る（選ぶ画面で決める・v0.10.0）。"""
+        if self.current_text() == "" and not self.composing():
+            self.send_key(VK_RETURN, "enter")
+        else:
+            self.send(submit=True)
+        return "break"
 
     def on_shift_enter(self, event):
         self.text.insert("insert", "\n")
