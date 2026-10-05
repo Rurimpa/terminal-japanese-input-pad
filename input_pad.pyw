@@ -9,6 +9,8 @@
 #           入力窓を出しているときに Windows Terminal を選ぶと、自動で入力窓へ移る（v0.6.0・Esc で戻ったときは移らない・config.json の auto_focus で切れる）
 #           入力窓の中の Ctrl+C（文字を選んでいないとき）＝元の窓へ Ctrl+C を送って止める（v0.7.0）
 #           Windows Terminal の窓ごとに入力窓を1つずつ出す（v0.8.0・Codex の窓など。書きかけは入力窓ごとに別々）
+#           入力窓が選ばれているときの Win＋矢印＝Windows Terminal の窓を寄せる（v0.9.0。↑全画面／←→左右半分／↓元に戻す。
+#           左右半分から↑↓で上下4分の1・v0.9.1）
 # 起動    ：pythonw input_pad.pyw（二重起動しない）
 # ログ    ：logs\input_pad_YYYYMMDD.log（打った文の中身は書かない。文字数だけ。送り先の窓の題名は残る）
 
@@ -32,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.8.0"
+VERSION = "0.9.1"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -65,10 +67,15 @@ VK_LBUTTON, VK_CONTROL, VK_SHIFT, VK_MENU, VK_RETURN, VK_V = 0x01, 0x11, 0x10, 0
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
 VK_TAB = 0x09
 VK_C = 0x43
+VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN = 0x25, 0x26, 0x27, 0x28
+VK_MENU_MASK = 0xE8     # どのキーにも割り当てられていない番号。Win を離したときにスタートメニューが開かないよう挟む
+SNAP_KEYS = {VK_LEFT: "left", VK_UP: "up", VK_RIGHT: "right", VK_DOWN: "down"}
+SNAP_TOLERANCE = 8      # 寄せた位置と「同じ」とみなす誤差（px）
 KEYEVENTF_KEYUP = 0x2
 # キーが押された瞬間を見張る仕組み（Tab で入力窓へ飛ぶため・v0.5.0）
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
 LLKHF_INJECTED = 0x10    # プログラムが送ったキー（入力窓が送る Ctrl+V など）の印
 
 
@@ -86,12 +93,13 @@ user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
 kernel32.GetModuleHandleW.restype = ctypes.c_void_p
 SW_RESTORE = 9
+SW_MINIMIZE = 6
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x2, 0x4, 0x10
 HWND_TOP = 0
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
-MONITOR_DEFAULTTONEAREST = 2
+MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTONEAREST = 0, 2
 TERMINAL_CLASS = "CASCADIA_HOSTING_WINDOW_CLASS"   # Windows Terminal の窓
 MIN_TERMINAL_HEIGHT = 240                          # これより縮めない（縮められないときは窓の一番下に重ねて出す）
 DOCK_INTERVAL_MS = 200
@@ -237,6 +245,18 @@ def work_area(hwnd):
     return w.left, w.top, w.right, w.bottom
 
 
+def work_area_at(x, y):
+    """その点がある画面の、タスクバーを除いた広さ。そこに画面が無ければ None。"""
+    mon = user32.MonitorFromPoint(wt.POINT(x, y), MONITOR_DEFAULTTONULL)
+    if not mon:
+        return None
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    user32.GetMonitorInfoW(mon, ctypes.byref(mi))
+    w = mi.rcWork
+    return w.left, w.top, w.right, w.bottom
+
+
 def set_visible_rect(hwnd, left, top, right, bottom):
     """見えている枠がこの位置になるよう、透明な縁の分を足して動かす。"""
     wl, wt_, wr, wb = window_rect(hwnd)
@@ -290,10 +310,12 @@ def tap(vk, with_ctrl=False):
 class HotkeyThread(threading.Thread):
     """RegisterHotKey は登録したスレッドのメッセージループに届くので、専用スレッドで待つ。"""
 
-    def __init__(self, modifiers, vk, events, tab_allowed=None):
+    def __init__(self, modifiers, vk, events, tab_allowed=None, snap_target=None):
         super().__init__(daemon=True)
         self.modifiers, self.vk, self.events = modifiers, vk, events
         self.tab_allowed = tab_allowed   # Tab で飛んでよいかを答える関数（None なら Tab は見張らない）
+        self.snap_target = snap_target   # 入力窓 → 受け持ちの Windows Terminal の窓を答える関数（v0.9.0）
+        self.snap_eaten = set()          # 横取りした矢印キー（離したときの知らせも相手へ渡さない・押しっぱなしの繰り返しは1回と数える）
         self.thread_id = None
         self.ok = threading.Event()
         self.error = None
@@ -308,7 +330,10 @@ class HotkeyThread(threading.Thread):
         try:
             if code == 0:
                 k = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                if k.vkCode == VK_TAB:
+                if k.vkCode in SNAP_KEYS and self.snap_target:
+                    if self.on_snap_key(k, wparam):
+                        return 1
+                if k.vkCode == VK_TAB and self.tab_allowed:
                     if wparam == WM_KEYUP and self.tab_eaten:
                         self.tab_eaten = False
                         return 1
@@ -324,18 +349,46 @@ class HotkeyThread(threading.Thread):
             logging.exception("tab hook failed")
         return user32.CallNextHookEx(None, code, wparam, lparam)
 
+    def on_snap_key(self, k, wparam):
+        """入力窓が選ばれているときの Win＋矢印を受け取り、受け持ちの Windows Terminal の窓を寄せる（v0.9.0）。
+        Windows は Win＋矢印を「いま選ばれている窓」にかける。入力窓へ自動で移る働き（v0.6.0）があるので、選ばれているのはほぼいつも入力窓で、
+        入力窓は枠なしの窓のため Windows は何もしなかった。横取りしたら True を返す。"""
+        if wparam in (WM_KEYUP, WM_SYSKEYUP):
+            if k.vkCode in self.snap_eaten:
+                self.snap_eaten.discard(k.vkCode)
+                return True
+            return False
+        if wparam not in (WM_KEYDOWN, WM_SYSKEYDOWN) or k.flags & LLKHF_INJECTED:
+            return False
+        if not any(user32.GetAsyncKeyState(m) & 0x8000 for m in (VK_LWIN, VK_RWIN)):
+            return False
+        if any(user32.GetAsyncKeyState(m) & 0x8000 for m in (VK_CONTROL, VK_SHIFT, VK_MENU)):
+            return False   # Win＋Shift＋矢印などは今までどおり Windows に任せる
+        if k.vkCode in self.snap_eaten:
+            return True    # 押しっぱなしの繰り返しは寄せ直さない
+        target = self.snap_target(user32.GetForegroundWindow())
+        if not target:
+            return False
+        self.snap_eaten.add(k.vkCode)
+        # Windows は「Win を押して何も押さずに離した」ときにスタートメニューを開く。矢印をここで止めたので、
+        # 割り当ての無いキーを1回挟み、Win だけを押したのではないと Windows に伝える
+        user32.keybd_event(VK_MENU_MASK, 0, 0, 0)
+        user32.keybd_event(VK_MENU_MASK, 0, KEYEVENTF_KEYUP, 0)
+        self.events.put(("snap", (target, SNAP_KEYS[k.vkCode])))
+        return True
+
     def run(self):
         self.thread_id = kernel32.GetCurrentThreadId()
         if not user32.RegisterHotKey(None, HOTKEY_ID, self.modifiers | MOD_NOREPEAT, self.vk):
             self.error = ctypes.get_last_error()
             self.ok.set()
             return
-        if self.tab_allowed:
+        if self.tab_allowed or self.snap_target:
             # 見張りの知らせは、見張りを付けたこのスレッドのメッセージループの中で届く
             self.tab_proc = HOOKPROC(self.on_key)   # 消えないよう持っておく
             self.tab_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.tab_proc, kernel32.GetModuleHandleW(None), 0)
             if self.tab_hook:
-                logging.info("tab jump on")
+                logging.info("key watch on (tab jump=%s, win+arrow=%s)", bool(self.tab_allowed), bool(self.snap_target))
             else:
                 logging.error("tab hook failed to install (error %s)", ctypes.get_last_error())
         self.ok.set()
@@ -366,6 +419,7 @@ class Pad:
         self.last_layout = None
         self.shown = False
         self.sending = False
+        self.saved_rect = None        # Win＋矢印で寄せる前の位置（Win＋↓ で戻すため・v0.9.0）
 
         self.win = tk.Toplevel(root)
         self.win.withdraw()
@@ -596,6 +650,86 @@ class Pad:
 
     def hwnd(self):
         return user32.GetAncestor(self.win.winfo_id(), 2) or self.win.winfo_id()
+
+    # --- Win＋矢印で寄せる（v0.9.0・4分の1は v0.9.1） ---
+    # 今の位置から押した向きへ1段ずつ動く。上下の段＝(左右半分 ↔ 上下4分の1)、画面いっぱいは↑の行き止まり
+    SNAP_UP = {"left": "top_left", "right": "top_right", "bottom_left": "left", "bottom_right": "right"}
+    SNAP_DOWN = {"left": "bottom_left", "right": "bottom_right", "top_left": "left", "top_right": "right"}
+    SNAP_SIDE = {("top_left", "right"): "top_right", ("top_right", "left"): "top_left",
+                 ("bottom_left", "right"): "bottom_right", ("bottom_right", "left"): "bottom_left"}
+
+    def snap(self, direction):
+        """受け持ちの Windows Terminal の窓を寄せる。入力窓の分の高さは、いつも窓のすぐ下に空けておく。
+        ↑＝画面いっぱい（左右半分のときは上の4分の1、下の4分の1のときは左右半分）
+        ↓＝左右半分のときは下の4分の1、上の4分の1のときは左右半分、ほかに寄せていれば寄せる前の位置、寄せていなければ最小化
+        ←→＝左半分・右半分（同じ向きをもう一度押すと隣の画面の反対側の半分へ、反対向きを押すと寄せる前の位置へ。
+             4分の1のときは同じ高さの反対側の4分の1へ）"""
+        t = self.target
+        if not t or not user32.IsWindow(t):
+            return
+        if user32.IsZoomed(t):
+            user32.ShowWindow(t, SW_RESTORE)
+        cur = visible_rect(t)
+        area = work_area(t)
+        layouts = self.snap_layouts(area)
+        state = next((name for name, r in layouts.items() if self.rect_close(cur, r)), None)
+        if state is None and direction != "down":
+            self.saved_rect = cur          # 寄せる前の位置を覚える
+        new = None
+        if direction == "up":
+            new = layouts[self.SNAP_UP.get(state, "full")]
+        elif direction == "down":
+            if state is None:
+                user32.ShowWindow(t, SW_MINIMIZE)
+                logging.info("snap down: free -> minimized")
+                return
+            if state in self.SNAP_DOWN:
+                new = layouts[self.SNAP_DOWN[state]]
+            elif self.saved_rect:
+                new = self.saved_rect
+            else:
+                # 寄せる前の位置を知らない（起動前から寄せてあった）ときは、画面の真ん中に 2/3 の大きさで出す
+                l, t_, r, b = layouts["full"]
+                w, h = (r - l) * 2 // 3, (b - t_) * 2 // 3
+                x, y = l + (r - l - w) // 2, t_ + (b - t_ - h) // 2
+                new = (x, y, x + w, y + h)
+        elif (state, direction) in self.SNAP_SIDE:
+            new = layouts[self.SNAP_SIDE[(state, direction)]]
+        else:
+            same, other = ("left", "right") if direction == "left" else ("right", "left")
+            if state == same or (state or "").endswith("_" + same):
+                # 端にいるのに同じ向きをもう一度＝その向きの隣の画面の、反対側の半分へ
+                x = area[0] - 1 if direction == "left" else area[2] + 1
+                next_area = work_area_at(x, (area[1] + area[3]) // 2)
+                if next_area is None:
+                    return
+                new = self.snap_layouts(next_area)[other]
+            elif state == other and self.saved_rect:
+                new = self.saved_rect      # 反対向き＝元の位置へ（Windows と同じ）
+            else:
+                new = layouts[same]
+        set_visible_rect(t, *new)
+        if new == self.saved_rect:
+            self.saved_rect = None
+        logging.info("snap %s: %s -> %s", direction, state or "free", new)
+        self.dock_once()
+
+    def snap_layouts(self, area):
+        """その画面で寄せる先の位置。どれも、窓のすぐ下に入力窓の分を空ける
+        （4分の1は、上下それぞれの半分の中に「窓＋入力窓」が収まる形）。"""
+        wl, wt_, wr, wb = area
+        ph = self.want_height(wt_, wb)
+        mid_x, mid_y = (wl + wr) // 2, (wt_ + wb) // 2
+        return {
+            "full": (wl, wt_, wr, wb - ph),
+            "left": (wl, wt_, mid_x, wb - ph), "right": (mid_x, wt_, wr, wb - ph),
+            "top_left": (wl, wt_, mid_x, mid_y - ph), "top_right": (mid_x, wt_, wr, mid_y - ph),
+            "bottom_left": (wl, mid_y, mid_x, wb - ph), "bottom_right": (mid_x, mid_y, wr, wb - ph),
+        }
+
+    @staticmethod
+    def rect_close(a, b):
+        return all(abs(x - y) <= SNAP_TOLERANCE for x, y in zip(a, b))
 
     # --- くっつく ---
     def dock(self):
@@ -860,6 +994,7 @@ class PadManager:
         self.font = tkfont.Font(family=cfg["font_family"], size=int(cfg["font_size"]))
         self.font_bold = tkfont.Font(family=cfg["font_family"], size=int(cfg["font_size"]), weight="bold")
         self.pads = {}          # 受け持ちの Windows Terminal の窓 → 入力窓
+        self.pad_to_target = {}  # 入力窓 → 受け持ちの窓（キーの見張りのスレッドから読む。Tk を呼ばずに引けるよう控える・v0.9.0）
         self.last_pad = None    # 最後に使った入力窓（Windows Terminal 以外が前にあるときのホットキーの行き先）
         self.sync()
 
@@ -879,6 +1014,7 @@ class PadManager:
                 self.last_pad = None
             pad.destroy()
             logging.info("pad removed for closed terminal %s (pads=%d)", h, len(self.pads))
+        self.pad_to_target = {p.hwnd(): h for h, p in self.pads.items()}   # 丸ごと差し替える（読む側と取り合わない）
 
     def tick(self):
         """200ms ごとに、窓を数え直し、それぞれの入力窓をくっつける。"""
@@ -908,6 +1044,15 @@ class PadManager:
             logging.info("hotkey: no terminal window")
             return
         pad.on_hotkey(fg)
+
+    def snap_target(self, fg):
+        """入力窓が選ばれているなら、その受け持ちの Windows Terminal の窓（キーの見張りのスレッドから呼ばれる）。"""
+        return self.pad_to_target.get(fg)
+
+    def on_snap(self, target, direction):
+        pad = self.pads.get(target)
+        if pad is not None and not pad.off:
+            pad.snap(direction)
 
     def tab_allowed(self, fg):
         """Tab を横取りしてよいか（キーの見張りのスレッドから呼ばれる）。その窓の入力窓があり、しまっていないときだけ。"""
@@ -944,7 +1089,7 @@ def main():
     events = queue.Queue()
     # 入力窓をしまっている間は Tab を横取りしない（しまったのは使う人の意思なので、Tab で勝手に出さない）
     tab_allowed = manager.tab_allowed if cfg.get("tab_jump", True) else None
-    hk = HotkeyThread(mods, vk, events, tab_allowed)
+    hk = HotkeyThread(mods, vk, events, tab_allowed, manager.snap_target)
     hk.start()
     hk.ok.wait(3)
     if hk.error is not None:
@@ -959,9 +1104,14 @@ def main():
     def poll():
         try:
             while True:
-                kind, hwnd = events.get_nowait()
+                kind, arg = events.get_nowait()
                 if kind == "hotkey":
-                    manager.on_hotkey(hwnd)
+                    manager.on_hotkey(arg)
+                elif kind == "snap":
+                    try:
+                        manager.on_snap(*arg)
+                    except Exception:
+                        logging.exception("snap failed")
         except queue.Empty:
             pass
         root.after(50, poll)
