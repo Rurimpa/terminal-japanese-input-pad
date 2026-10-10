@@ -13,6 +13,7 @@
 #           入力窓が空のときの ↑・↓・Enter＝元の窓へ送る（v0.10.0。Claude Code の選ぶ画面を入力窓のまま選べる）
 #           入力窓が選ばれているときの Win＋矢印＝Windows Terminal の窓を寄せる（v0.9.0。↑全画面／←→左右半分／↓元に戻す。
 #           左右半分から↑↓で上下4分の1・v0.9.1）
+#           「メモ：」で始まる文は、config.json の memo_file にファイルの場所を書いたときだけ、元の窓へ送らずにそのファイルへ1行足す（v0.11.0・既定は切）
 # 起動    ：pythonw input_pad.pyw（二重起動しない）
 # ログ    ：logs\input_pad_YYYYMMDD.log（打った文の中身は書かない。文字数だけ。送り先の窓の題名は残る）
 
@@ -22,6 +23,7 @@ import json
 import os
 import logging
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -36,7 +38,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -124,7 +126,31 @@ DEFAULT_CONFIG = {
     "pad_lines": 3,
     "tab_jump": True,    # Windows Terminal が前にあるとき Tab で入力窓へ飛ぶ（false で切る）
     "auto_focus": True,  # Windows Terminal を選ぶと自動で入力窓へ移る（false で切る）
+    "memo_file": "",     # 「メモ：」で始まる文を、元の窓へ送らずにこのファイルへ1行足す（v0.11.0。空なら切＝今までどおり送る）
 }
+
+# 「メモ：」「メモ:」「メモ；」「メモ;」「めも：」で始まる文（前の空白は無視）。
+# Claude Code の UserPromptSubmit フックで同じ「メモ：」を受け取る仕組みと並べて使えるよう、見分け方をそろえてある
+MEMO_HEAD = re.compile(r"^\s*(メモ|めも)\s*[:：;；]\s*")
+
+
+def memo_body(text):
+    """「メモ：」で始まる文なら、頭を除いた本文を返す（本文が空なら ""）。メモでなければ None。"""
+    m = MEMO_HEAD.match(text)
+    return text[m.end():].strip() if m else None
+
+
+def write_memo(path, text, window=""):
+    """受け取りファイルへ1行足す（JSON Lines）。1行の形は Claude Code のフックが書く行（at・seat_dir・session_id・text）にそろえ、
+    入力パッドからは分からない席のフォルダと session_id は空にし、来た所（source）と送り先の窓の題名（window）を足す。
+    書けなければ例外をそのまま上げる（呼ぶ側が欄に文を残す）。"""
+    rec = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "seat_dir": "", "session_id": "",
+           "text": text, "source": "input_pad", "window": window}
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return rec
 
 
 class MONITORINFO(ctypes.Structure):
@@ -994,9 +1020,42 @@ class Pad:
         return "break"
 
     # --- 貼り付け ---
+    def show_status(self, text, color, ms=5000):
+        """下の案内の行に知らせを出し、ms ミリ秒たったら元のキーの案内へ戻す。"""
+        if not hasattr(self, "status_help"):
+            self.status_help = (self.status.cget("text"), self.status.cget("fg"))
+        self.status.config(text=text, fg=color)
+        if getattr(self, "status_job", None):
+            self.root.after_cancel(self.status_job)
+        self.status_job = self.root.after(ms, lambda: self.status.config(text=self.status_help[0], fg=self.status_help[1]))
+
+    def save_memo(self, body):
+        """「メモ：」の文を、元の窓へ送らずに受け取りファイルへ書く（v0.11.0・config.json の memo_file を入れたときだけ）。
+        Claude Code のフックでメモを止めると、止めた文が Claude Code の入力欄へ戻り、入力窓からは消せずに次の文とつながった
+        （2026-10-10 に2回）。入力窓で受け取れば、元の窓へは1文字も行かない。
+        書けたら欄を空にする。書けなければ欄に文を残し、赤字で知らせる（メモを消さない）。"""
+        text = memo_body(body)
+        if not text:
+            self.show_status("メモの中身が空でした。「メモ：」のあとに書いて送ってください。", "#ff8080")
+            return
+        try:
+            write_memo(self.cfg["memo_file"], text, window_title(self.target) if self.target else "")
+        except Exception as e:
+            logging.exception("memo save failed")
+            self.show_status(f"メモを書けませんでした（{e}）。文は欄に残してあります。", "#ff8080", ms=15000)
+            return
+        logging.info("memo saved %d chars", len(text))
+        self.text.delete("1.0", "end")
+        self.text.edit_reset()
+        self.update_placeholder()
+        self.show_status("メモを受け取りファイルへ書きました（元の窓へは送っていません）", "#7ee787")
+
     def send(self, submit):
         body = self.current_text()
         if not body.strip():
+            return
+        if self.cfg.get("memo_file") and memo_body(body) is not None:
+            self.save_memo(body)
             return
         if not self.target or not user32.IsWindow(self.target):
             self.status.config(text="貼り付け先の Windows Terminal が見つかりません。", fg="#ff8080")
