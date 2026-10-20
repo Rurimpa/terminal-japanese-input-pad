@@ -38,7 +38,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.11.0"
+VERSION = "0.11.2"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -64,6 +64,10 @@ GWLP_WNDPROC = -4
 # 入れる窓の値に -1（いつも手前）などを渡すので、64ビットでも正しく渡るよう型を決めておく
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
 user32.SetWindowPos.restype = wt.BOOL
+user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+user32.GetAncestor.restype = wt.HWND
+user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
 
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
 WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
@@ -102,6 +106,8 @@ SW_MINIMIZE = 6
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x2, 0x4, 0x10
 HWND_TOP = 0
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+GA_ROOTOWNER = 3   # GetAncestor：持ち主をたどった、いちばん元の窓（v0.11.1）
+GWL_EXSTYLE, WS_EX_TOPMOST = -20, 0x00000008   # 「いつも手前」の印を読む（v0.11.2）
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTONEAREST = 0, 2
@@ -249,6 +255,11 @@ def is_cloaked(hwnd):
     if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(v), ctypes.sizeof(v)) == 0:
         return v.value != 0
     return False
+
+
+def is_topmost(hwnd):
+    """「いつも手前」の印が付いている窓か（v0.11.2）。"""
+    return bool(user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
 
 
 def window_rect(hwnd):
@@ -845,10 +856,20 @@ class Pad:
             if not self.topmost:
                 user32.SetWindowPos(me, HWND_TOPMOST, 0, 0, 0, 0, flags)
                 self.topmost = True
-        elif self.topmost:
+        elif self.topmost or is_topmost(me):
+            # 自分の覚え（self.topmost）だけでなく、Windows に毎回「いつも手前」が付いているかを聞く（v0.11.2）
+            if not self.topmost:
+                logging.info("topmost left over (selected %r)", class_name(fg))
             user32.SetWindowPos(me, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
-            if fg:
-                user32.SetWindowPos(me, fg, 0, 0, 0, 0, flags)   # いま選ばれている窓のすぐ後ろへ
+            # いま選ばれている窓のすぐ後ろへ。持ち主のいる窓（Excel の入力フォームなど）なら、持ち主のすぐ後ろへ（v0.11.1）。
+            # 入力フォームのすぐ後ろへ入れると、入力フォームと Excel 本体のあいだに挟まり、Excel 本体の手前に残った
+            # （2026-10-20 09:07）
+            behind = user32.GetAncestor(fg, GA_ROOTOWNER) if fg else 0
+            # 「いつも手前」の窓（タスクバーなど）のすぐ後ろへ入れると、Windows は入力窓も「いつも手前」にしてしまう。
+            # タスクバーをクリックしたあと、LINE の上に入力窓が残った（2026-10-20 17:09・v0.11.2）。その窓の後ろへは入れない
+            if behind and behind != me and not is_topmost(behind):
+                user32.SetWindowPos(me, behind, 0, 0, 0, 0, flags)
+                logging.info("pad behind %r (selected %r)", class_name(behind), class_name(fg))
             self.topmost = False
 
     def place_below(self, vl, vb, vr, h, wb):
