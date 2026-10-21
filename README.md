@@ -106,6 +106,7 @@ pythonw input_pad.pyw
 - 送る先は、Windows Terminal の窓でいま開いているタブです
 - 画面のスクリーンショット道具で「アクティブな窓」を撮ると、入力窓を選んでいるときは入力窓だけが撮れます（別の窓のため）
 - Tab で入力窓へ飛ぶため、Windows Terminal の中では Tab で候補を確定する操作（Claude Code の / のコマンドやファイル名の候補など）が使えません。使いたいときは `config.json` に `"tab_jump": false` と書いてください。Windows Terminal に直接日本語を打っていて、変換中に Tab で予測候補を選ぶ操作も入力窓へ飛ぶ動きになります
+- 2行以上の文を送ると、Windows Terminal が「複数行を貼り付けますか」という警告を出し、入力窓の Enter がその警告の「貼り付け」に使われることがあります（コマンドプロンプトなどで最後の行が実行されずに残ります）。Windows Terminal の設定（settings.json）に "warning.multiLinePaste": false を足すと、警告が出なくなります
 
 ## ライセンス
 
