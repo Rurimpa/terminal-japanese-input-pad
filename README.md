@@ -19,9 +19,11 @@ A small always-on input box docked under Windows Terminal, for typing Japanese w
 ## なぜ作ったか
 
 Windows Terminal で Claude Code などの対話型のコマンドラインツールを使うと、日本語入力（IME）の予測候補・変換候補の窓が、打っている文字の上に重なって読めないことがあります。
-原因は Windows Terminal の不具合です（[microsoft/terminal#20318](https://github.com/microsoft/terminal/issues/20318)）。直し（[microsoft/terminal#20627](https://github.com/microsoft/terminal/pull/20627)）は 2026-09-01 に Windows Terminal の開発版へ入りましたが、2026-10-01 時点で配布されている Stable（1.24.11911.0）・Preview（1.25.1912.0）にはまだ入っていません（Canary には入っています）。利用者の側の設定では直せません。参考：[anthropics/claude-code#70955](https://github.com/anthropics/claude-code/issues/70955)
+原因は Windows Terminal の不具合でした（[microsoft/terminal#20318](https://github.com/microsoft/terminal/issues/20318)）。参考：[anthropics/claude-code#70955](https://github.com/anthropics/claude-code/issues/70955)
 
-この道具は、Windows Terminal の直しが届くまでのつなぎです。直しの入った版が配られたら、要らなくなるかもしれません。
+**2026-10-02 に出た Windows Terminal 1.25.2733.0（Stable）と 1.24.12741.0 で直りました**（[microsoft/terminal#20627](https://github.com/microsoft/terminal/pull/20627)）。1.25.2733.0 で、窓を最大化したときもしていないときも、候補の窓が文字に重ならないことを確かめました（2026-10-29・Google 日本語入力）。重なって困っているなら、まず Windows Terminal を新しい版にしてください。
+
+この道具は、もともと Windows Terminal の直しが届くまでのつなぎとして作りました。直ったあとも、長い文を書いて直してから送る・コピーや貼り付けがしやすい、などのために使い続けられます。
 
 この道具は、Windows Terminal の窓のすぐ下に普通の Windows の入力窓を置きます。そこで打てば、候補の窓は文字の位置に正しく出て、重なりません。打ち終わって Enter を押すと、文が元の窓へ貼り付けられ、そのまま送信されます。
 
@@ -35,6 +37,7 @@ Windows Terminal で Claude Code などの対話型のコマンドラインツ�
 - Windows Terminal の窓ごとに入力窓が1つずつ出る（Claude Code と Codex を別の窓で開いているときなど・v0.8.0）。書きかけの文は入力窓ごとに別々に残り、窓を閉じるとその入力窓も消える
 - **↑・↓・Enter**（入力窓が空のとき）＝元の窓へ送る（v0.10.0）。Claude Code の選ぶ画面（フォルダを信用するか・許可の質問・/model など）を、入力窓にいたまま選べる。文字があるときや日本語の変換中は、入力窓の中で働く
 - **Win＋矢印**（入力窓が選ばれているとき）＝Windows Terminal の窓を寄せる（v0.9.1）。↑＝画面いっぱい／←→＝左半分・右半分／↓＝寄せる前の位置。左右半分から↑↓で上下4分の1。どれも下に入力窓の分を空ける。Windows のスナップ補助（残り半分に置く窓を選ぶ画面）は出ない
+- **PrintScreen**（入力窓が選ばれているとき・ほかのキーと一緒に押していないとき）＝元の Windows Terminal の窓を選び直してから PrintScreen を渡し、撮り終わったら入力窓へ戻る（v0.12.0）。「アクティブな窓」を撮るスクリーンショットの道具（ShareX など）で、入力窓ではなく Windows Terminal の窓が撮れる。Shift+PrintScreen などは今までどおり。`config.json` に `"print_screen": false` と書くと切れる
 - **Tab**（Windows Terminal が前にあるとき）＝入力窓へ飛ぶ（v0.5.0）。Ctrl・Shift・Alt・Win を押しているときと、入力窓をしまっているときは、ふつうの Tab として届く
 - 入力窓を出しているときに Windows Terminal を選ぶ（クリック・Alt+Tab など）と、自動で入力窓へ移る（v0.6.0）。入力窓から **Esc** で戻ったときは移らないので、Claude Code の許可の質問に答えたり、Esc で止めたりできる。Tab などで入力窓へ戻ると、また移るようになる
 - **「メモ：」で始まる文**＝元の窓へ送らず、`config.json` の `memo_file` に書いたファイルへ1行足す（v0.11.0・書いたときだけ動く）。下の「メモを受け取りファイルへ書く」を参照
@@ -74,7 +77,8 @@ pythonw input_pad.pyw
   "tab_jump": true,
   "auto_focus": true,
   "pad_height": 120,
-  "memo_file": ""
+  "memo_file": "",
+  "print_screen": true
 }
 ```
 
@@ -104,7 +108,7 @@ pythonw input_pad.pyw
 
 - 送るときにクリップボードを使います（送った文がクリップボードに残ります）
 - 送る先は、Windows Terminal の窓でいま開いているタブです
-- 画面のスクリーンショット道具で「アクティブな窓」を撮ると、入力窓を選んでいるときは入力窓だけが撮れます（別の窓のため）
+- スクリーンショット道具で「アクティブな窓」を PrintScreen 以外のキーで撮る設定にしているときは、入力窓を選んでいると入力窓だけが撮れます（別の窓のため）。PrintScreen で撮るときは、v0.12.0 から Windows Terminal の窓が撮れます（その写真に入力窓は入りません）
 - Tab で入力窓へ飛ぶため、Windows Terminal の中では Tab で候補を確定する操作（Claude Code の / のコマンドやファイル名の候補など）が使えません。使いたいときは `config.json` に `"tab_jump": false` と書いてください。Windows Terminal に直接日本語を打っていて、変換中に Tab で予測候補を選ぶ操作も入力窓へ飛ぶ動きになります
 - 2行以上の文を送ると、Windows Terminal が「複数行を貼り付けますか」という警告を出し、入力窓の Enter がその警告の「貼り付け」に使われることがあります（コマンドプロンプトなどで最後の行が実行されずに残ります）。Windows Terminal の設定（settings.json）に "warning.multiLinePaste": false を足すと、警告が出なくなります
 

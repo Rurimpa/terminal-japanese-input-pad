@@ -14,6 +14,8 @@
 #           入力窓が選ばれているときの Win＋矢印＝Windows Terminal の窓を寄せる（v0.9.0。↑全画面／←→左右半分／↓元に戻す。
 #           左右半分から↑↓で上下4分の1・v0.9.1）
 #           「メモ：」で始まる文は、config.json の memo_file にファイルの場所を書いたときだけ、元の窓へ送らずにそのファイルへ1行足す（v0.11.0・既定は切）
+#           入力窓が選ばれているときの PrintScreen（ほかのキーと一緒に押していないとき）＝元の Windows Terminal の窓を選び直してから
+#           PrintScreen を渡し、撮り終わったら入力窓へ戻る（v0.12.0。「選ばれている窓」を撮るソフトで黒い画面が撮れる・config.json の print_screen で切れる）
 # 起動    ：pythonw input_pad.pyw（二重起動しない）
 # ログ    ：logs\input_pad_YYYYMMDD.log（打った文の中身は書かない。文字数だけ。送り先の窓の題名は残る）
 
@@ -38,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.11.2"
+VERSION = "0.12.0"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -81,6 +83,11 @@ VK_MENU_MASK = 0xE8     # どのキーにも割り当てられていない番号
 SNAP_KEYS = {VK_LEFT: "left", VK_UP: "up", VK_RIGHT: "right", VK_DOWN: "down"}
 SNAP_TOLERANCE = 8      # 寄せた位置と「同じ」とみなす誤差（px）
 KEYEVENTF_KEYUP = 0x2
+KEYEVENTF_EXTENDEDKEY = 0x1
+VK_SNAPSHOT = 0x2C       # PrintScreen（v0.12.0）
+PRINT_SCAN = 0x37        # PrintScreen の位置の番号（拡張キー）
+PRINT_SWITCH_MS = 150    # 元の窓を選び直してから PrintScreen を渡すまで待つ時間
+PRINT_HOLD_MS = 1500     # PrintScreen を渡してから入力窓へ戻るまで待つ時間（撮り終わるのを待つ）
 # キーが押された瞬間を見張る仕組み（Tab で入力窓へ飛ぶため・v0.5.0）
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
@@ -133,6 +140,7 @@ DEFAULT_CONFIG = {
     "tab_jump": True,    # Windows Terminal が前にあるとき Tab で入力窓へ飛ぶ（false で切る）
     "auto_focus": True,  # Windows Terminal を選ぶと自動で入力窓へ移る（false で切る）
     "memo_file": "",     # 「メモ：」で始まる文を、元の窓へ送らずにこのファイルへ1行足す（v0.11.0。空なら切＝今までどおり送る）
+    "print_screen": True,  # 入力窓が選ばれているときの PrintScreen を、元の窓を選び直してから渡す（v0.12.0。false で切る）
 }
 
 # 「メモ：」「メモ:」「メモ；」「メモ;」「めも：」で始まる文（前の空白は無視）。
@@ -347,14 +355,22 @@ def tap(vk, with_ctrl=False):
         user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
 
 
+def tap_print_screen():
+    """PrintScreen を1回押したことにする（送ったキーの印が付くので、入力窓のキーの見張りは横取りしない）。"""
+    user32.keybd_event(VK_SNAPSHOT, PRINT_SCAN, KEYEVENTF_EXTENDEDKEY, 0)
+    user32.keybd_event(VK_SNAPSHOT, PRINT_SCAN, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+
+
 class HotkeyThread(threading.Thread):
     """RegisterHotKey は登録したスレッドのメッセージループに届くので、専用スレッドで待つ。"""
 
-    def __init__(self, modifiers, vk, events, tab_allowed=None, snap_target=None):
+    def __init__(self, modifiers, vk, events, tab_allowed=None, snap_target=None, print_target=None):
         super().__init__(daemon=True)
         self.modifiers, self.vk, self.events = modifiers, vk, events
         self.tab_allowed = tab_allowed   # Tab で飛んでよいかを答える関数（None なら Tab は見張らない）
         self.snap_target = snap_target   # 入力窓 → 受け持ちの Windows Terminal の窓を答える関数（v0.9.0）
+        self.print_target = print_target  # 同じ関数。PrintScreen を見張るときだけ渡す（v0.12.0・None なら見張らない）
+        self.print_eaten = False          # 横取りした PrintScreen の、離したときの知らせも相手へ渡さないため
         self.snap_eaten = set()          # 横取りした矢印キー（離したときの知らせも相手へ渡さない・押しっぱなしの繰り返しは1回と数える）
         self.thread_id = None
         self.ok = threading.Event()
@@ -372,6 +388,9 @@ class HotkeyThread(threading.Thread):
                 k = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                 if k.vkCode in SNAP_KEYS and self.snap_target:
                     if self.on_snap_key(k, wparam):
+                        return 1
+                if k.vkCode == VK_SNAPSHOT and self.print_target:
+                    if self.on_print_key(k, wparam):
                         return 1
                 if k.vkCode == VK_TAB and self.tab_allowed:
                     if wparam == WM_KEYUP and self.tab_eaten:
@@ -417,18 +436,41 @@ class HotkeyThread(threading.Thread):
         self.events.put(("snap", (target, SNAP_KEYS[k.vkCode])))
         return True
 
+    def on_print_key(self, k, wparam):
+        """入力窓が選ばれているときの PrintScreen を受け取る（v0.12.0）。横取りしたら True を返す。
+        ShareX の PrintScreen は「いま選ばれている窓」を撮る設定で、入力窓へ自動で移る働き（v0.6.0）があるので、ほぼいつも入力窓だけが撮られていた。
+        ここでは止めるだけにし、元の窓を選び直してから PrintScreen を渡すのは Tk 側でやる（Pad.print_screen）。
+        押したときの知らせが来ないこともあるので、離したときの知らせでも受け取る。"""
+        if k.flags & LLKHF_INJECTED:
+            return False   # 入力窓が自分で渡した PrintScreen は、そのまま撮るソフトへ通す
+        down = wparam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        if not down and self.print_eaten:
+            self.print_eaten = False
+            return True
+        if down and self.print_eaten:
+            return True    # 押しっぱなしの繰り返しは1回と数える
+        if any(user32.GetAsyncKeyState(m) & 0x8000 for m in (VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN)):
+            return False   # Shift+PrintScreen（範囲を選んで撮る）などは今までどおり撮るソフトに任せる
+        target = self.print_target(user32.GetForegroundWindow())
+        if not target:
+            return False
+        self.print_eaten = down
+        self.events.put(("print", target))
+        return True
+
     def run(self):
         self.thread_id = kernel32.GetCurrentThreadId()
         if not user32.RegisterHotKey(None, HOTKEY_ID, self.modifiers | MOD_NOREPEAT, self.vk):
             self.error = ctypes.get_last_error()
             self.ok.set()
             return
-        if self.tab_allowed or self.snap_target:
+        if self.tab_allowed or self.snap_target or self.print_target:
             # 見張りの知らせは、見張りを付けたこのスレッドのメッセージループの中で届く
             self.tab_proc = HOOKPROC(self.on_key)   # 消えないよう持っておく
             self.tab_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.tab_proc, kernel32.GetModuleHandleW(None), 0)
             if self.tab_hook:
-                logging.info("key watch on (tab jump=%s, win+arrow=%s)", bool(self.tab_allowed), bool(self.snap_target))
+                logging.info("key watch on (tab jump=%s, win+arrow=%s, printscreen=%s)",
+                             bool(self.tab_allowed), bool(self.snap_target), bool(self.print_target))
             else:
                 logging.error("tab hook failed to install (error %s)", ctypes.get_last_error())
         self.ok.set()
@@ -981,6 +1023,36 @@ class Pad:
     def send_ctrl_c(self):
         self.send_key(VK_C, "ctrl+c", with_ctrl=True)
 
+    def print_screen(self):
+        """元の Windows Terminal の窓を選び直してから PrintScreen を渡し、撮り終わったら入力窓へ戻る（v0.12.0）。
+        待つ間は send_key と違って Tk を止めない（止めると、撮るソフトが窓を調べる間に入力窓が応えなくなるため）。
+        待つ間は sending を立てて、自動で入力窓へ移る働き（auto_focus）とくっつく働きを休ませる。"""
+        if self.sending or not self.target or not user32.IsWindow(self.target):
+            tap_print_screen()   # 選び直せないときも、撮ること自体は止めない
+            logging.info("printscreen passed through (sending=%s)", self.sending)
+            return
+        self.sending = True
+        if not force_foreground(self.target):
+            logging.warning("SetForegroundWindow failed target=%s", self.target)
+        self.root.after(PRINT_SWITCH_MS, self.print_screen_send)
+
+    def print_screen_send(self):
+        try:
+            tap_print_screen()
+            logging.info("printscreen sent target=%r fg_is_target=%s",
+                         window_title(self.target), user32.GetForegroundWindow() == self.target)
+        except Exception:
+            logging.exception("printscreen send failed")
+        self.root.after(PRINT_HOLD_MS, self.print_screen_done)
+
+    def print_screen_done(self):
+        self.sending = False
+        # 撮るソフトが自分の窓（写真の編集画面など）を前に出していたら、それを奪わない
+        if user32.GetForegroundWindow() == self.target:
+            self.activate()
+        else:
+            logging.info("printscreen done; stay with %r", class_name(user32.GetForegroundWindow()))
+
     def send_key(self, vk, label, with_ctrl=False):
         """元の窓を前に出してキーを1回送り、入力窓へ戻る（Ctrl+C・v0.7.0／↑↓Enter・v0.10.0）。"""
         if not self.target or not user32.IsWindow(self.target):
@@ -1180,6 +1252,13 @@ class PadManager:
         if pad is not None and not pad.off:
             pad.snap(direction)
 
+    def on_print(self, target):
+        pad = self.pads.get(target)
+        if pad is not None and not pad.off:
+            pad.print_screen()
+        else:
+            tap_print_screen()   # 受け持ちの入力窓が見つからなくても、撮ること自体は止めない
+
     def tab_allowed(self, fg):
         """Tab を横取りしてよいか（キーの見張りのスレッドから呼ばれる）。その窓の入力窓があり、しまっていないときだけ。"""
         pad = self.pads.get(fg)
@@ -1215,7 +1294,8 @@ def main():
     events = queue.Queue()
     # 入力窓をしまっている間は Tab を横取りしない（しまったのは使う人の意思なので、Tab で勝手に出さない）
     tab_allowed = manager.tab_allowed if cfg.get("tab_jump", True) else None
-    hk = HotkeyThread(mods, vk, events, tab_allowed, manager.snap_target)
+    print_target = manager.snap_target if cfg.get("print_screen", True) else None
+    hk = HotkeyThread(mods, vk, events, tab_allowed, manager.snap_target, print_target)
     hk.start()
     hk.ok.wait(3)
     if hk.error is not None:
@@ -1238,6 +1318,12 @@ def main():
                         manager.on_snap(*arg)
                     except Exception:
                         logging.exception("snap failed")
+                elif kind == "print":
+                    try:
+                        manager.on_print(arg)
+                    except Exception:
+                        logging.exception("printscreen failed")
+                        tap_print_screen()
         except queue.Empty:
             pass
         root.after(50, poll)
