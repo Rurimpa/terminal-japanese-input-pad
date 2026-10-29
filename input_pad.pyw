@@ -8,6 +8,7 @@
 #           Ctrl+Shift+J（config.json で変えられる）＝入力窓と元の窓を行き来する
 #           Windows Terminal が前にあるときの Tab＝入力窓へ飛ぶ（v0.5.0・config.json の tab_jump で切れる）
 #           入力窓を出しているときに Windows Terminal を選ぶと、自動で入力窓へ移る（v0.6.0・Esc で戻ったときは移らない・config.json の auto_focus で切れる）
+#           ただし、いちばん上の帯（タブ・∨・最小化など）を押したときは移らない（v0.12.1。∨ から設定を開けるように）
 #           入力窓の中の Ctrl+C（文字を選んでいないとき）＝元の窓へ Ctrl+C を送って止める（v0.7.0）
 #           Windows Terminal の窓ごとに入力窓を1つずつ出す（v0.8.0・Codex の窓など。書きかけは入力窓ごとに別々）
 #           入力窓が空のときの ↑・↓・Enter＝元の窓へ送る（v0.10.0。Claude Code の選ぶ画面を入力窓のまま選べる）
@@ -40,7 +41,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "日本語入力パッド"
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 CONFIG_PATH = ROOT_DIR / "config.json"
@@ -119,6 +120,7 @@ DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTONEAREST = 0, 2
 TERMINAL_CLASS = "CASCADIA_HOSTING_WINDOW_CLASS"   # Windows Terminal の窓
+TOP_STRIP_H = 40                                   # Windows Terminal のいちばん上の帯の高さ（100% のとき・v0.12.1）
 MIN_TERMINAL_HEIGHT = 240                          # これより縮めない（縮められないときは窓の一番下に重ねて出す）
 DOCK_INTERVAL_MS = 200
 ACCENT_LINE = 2          # 上の線の太さ（v0.3.4。旧 4px）
@@ -282,6 +284,25 @@ def visible_rect(hwnd):
     if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r)) == 0:
         return r.left, r.top, r.right, r.bottom
     return window_rect(hwnd)
+
+
+def cursor_in_top_strip(hwnd):
+    """マウスが、その窓のいちばん上の帯（タブ・∨・最小化などが並ぶ所）にあるか（v0.12.1）。
+    帯＝窓の上の端から、窓の中身が始まる位置（Windows のタイトルの帯の下の端）＋タブの段 TOP_STRIP_H まで。
+    タブをタイトルの帯に入れない設定（showTabsInTitlebar: false）ではタブの段がタイトルの帯の下にあり、
+    40px の決め打ちでは ∨（上から 54〜64px）が外れた（2026-10-30 08:47 の記録）。タブの段の高さは画面の拡大率に合わせて広げる。"""
+    pt = wt.POINT()
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        return False
+    try:
+        dpi = user32.GetDpiForWindow(hwnd) or 96
+    except Exception:
+        dpi = 96
+    l, t, r, _ = visible_rect(hwnd)
+    origin = wt.POINT(0, 0)
+    client_top = origin.y if user32.ClientToScreen(hwnd, ctypes.byref(origin)) else t   # 聞けなければ窓の上の端から
+    top = max(t, client_top)
+    return l <= pt.x < r and t <= pt.y < top + TOP_STRIP_H * dpi // 96
 
 
 def work_area(hwnd):
@@ -884,7 +905,17 @@ class Pad:
         self.focus_pending = False
         if self.stay_in_target or self.off or not self.shown:
             return
-        logging.info("auto focus -> pad (from %r)", getattr(self, "pending_from", ""))
+        # どこを押したときに移した・移さなかったかを追えるよう、マウスの位置（窓の左上から）と前の窓の種類を残す（v0.12.1）
+        pt = wt.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        vl, vt, _, _ = visible_rect(self.target)
+        where = "cursor=(%d,%d) fg=%r" % (pt.x - vl, pt.y - vt, class_name(user32.GetForegroundWindow()))
+        if cursor_in_top_strip(self.target):
+            # いちばん上の帯（タブ・∨・最小化など）を押したときは移さない（v0.12.1「入力パッドに引っ張られてしまう」。
+            # ∨ を押して出た一覧が、入力窓へ移った瞬間に閉じていた）
+            logging.info("auto focus skipped: top strip (from %r) %s", getattr(self, "pending_from", ""), where)
+            return
+        logging.info("auto focus -> pad (from %r) %s", getattr(self, "pending_from", ""), where)
         self.activate()
 
     def keep_z_order(self):
